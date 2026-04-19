@@ -436,5 +436,79 @@ Here are some more examples for reference:
     "Reflections": "I reflect that the manipulation intent involved creating an entirely different scene by introducing human subjects and a barbershop environment. This required me to focus on capturing the new setting details, including the interaction between the man and the boy, the objects they interact with, and the new atmosphere that evokes a sense of everyday life.",
     "Target Image Description": "A man giving a young boy a haircut in a barbershop."
 }
+'''
 
+image_mllm_structural_predictor_prompt_CoT = '''
+Your task is to modify the reference image based on the modification instructions and generate the updated image description. The description should be complete and can cover various semantic aspects, such as cardinality, addition, negation, direct addressing, compare & change, comparative, conjunction, spatial relations & background, viewpoint.
+
+To complete the task accurately, please follow these steps:
+### Understand the Reference Image ###
+1. Identify all the objects, attributes, and their relationships in the image.
+2. Pay attention to the spatial relations, background, viewpoint in the image.
+3. Please complete this task step by step.
+
+### Analyze the Modification Instructions ###
+1. Break down the modification instructions into separate modification steps.
+2. Determine which objects or attributes need to be modified and how.
+3. Pay attention to any additions, deletions, or changes to attributes.
+4. Please complete this task step by step.
+
+### Apply the Modifications###
+1. Apply the modifications step by step to update the content of the reference image.
+
+### Generate the Target Image Caption ###
+1. Write a coherent and concise image caption.
+2. Ensure the caption accurately reflects all the modifications.
+3. The edited caption needs to be as simple as possible.
+4. Do not mention the content that will not be present in the target image.
+
+## On the input format <Input>
+- Input consist of two parts: The reference image and the modification instructions.
+{
+    "Reference Image": <image_url>,
+    "Modification Text": <modification_text>.
+}
+    - The reference image is a URL provided in the image_url field of the user content data type, which furnishes the content of the reference image.
+    - The modification instructions is the text that describes the changes to be made to the reference image.
+
+## Guidelines on determining the response <Response>
+- Response is the Target Image Description.
+{
+    "Target Image Description": <target_image_description>
+}
+
+Here are some more examples for reference:
+
+## Example 1
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "add one more deer and add some sunlight."
+}
+<Response>
+{
+    "Target Image Description": "Two deer are standing in a sunlit grassy field."
+}
+
+## Example 2
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "Focus on a single bird with open wings and get closer"
+}
+<Response>
+{
+    "Target Image Description": "A close-up of a single black vulture centered with wings spread against a softly blurred background."
+}
+
+## Example 3
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "Replace entire content with saloon spot with man and boy in window wal background effect."
+}
+<Response>
+{
+    "Target Image Description": "A man giving a young boy a haircut in a barbershop."
+}
 '''
