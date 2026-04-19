@@ -312,12 +312,25 @@ class AutoEncoder(nn.Module):
         self.scale_factor = params.scale_factor
         self.shift_factor = params.shift_factor
 
+    # def encode(self, x: Tensor) -> Tensor:
+    #     z = self.reg(self.encoder(x))
+    #     z = self.scale_factor * (z - self.shift_factor)
+    #     return z
+
+    # def decode(self, z: Tensor) -> Tensor:
+    #     z = z / self.scale_factor + self.shift_factor
+    #     return self.decoder(z)
+
     def encode(self, x: Tensor) -> Tensor:
+        param = next(self.parameters())
+        x = x.to(device=param.device, dtype=param.dtype)
         z = self.reg(self.encoder(x))
         z = self.scale_factor * (z - self.shift_factor)
         return z
 
     def decode(self, z: Tensor) -> Tensor:
+        param = next(self.parameters())
+        z = z.to(device=param.device, dtype=param.dtype)
         z = z / self.scale_factor + self.shift_factor
         return self.decoder(z)
 
