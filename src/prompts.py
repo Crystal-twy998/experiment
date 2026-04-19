@@ -512,3 +512,184 @@ Here are some more examples for reference:
     "Target Image Description": "A man giving a young boy a haircut in a barbershop."
 }
 '''
+
+mllm_structural_predictor_prompt_CoT_multi = '''
+You are an advanced reasoning expert tasked with generating potential target image descriptions for Composed Image Retrieval.
+
+The relationship between reference image ($I_r$), modification text ($T_m$), and target image ($I_t$) is complex. The target image should be a coherent scene satisfying $T_m$, while selectively retaining relevant elements from $I_r$. Correctly determining *which* elements to retain, especially when $T_m$ involves implicit spatial, viewpoint, or scale changes, is challenging due to inherent ambiguity.
+
+To systematically explore the ambiguity of user intent and maximize retrieval coverage, your task is to generate three distinct target query descriptions by following three complementary reasoning paths, representing different hypotheses about element retention. Each description must be concise, objective, and focused on retrievable visual content.
+
+**Please complete this task STEP-BY-STEP.**
+---------------------------------------------
+### **Step 1: Analyze the Multi-Modal Queries**
+Perform a comprehensive analysis of both inputs:
+1.  **Understand the Reference Image ($I_r$)**:
+    * Identify primary objects, their attributes, and spatial relationships.
+    * Analyze scene context, background elements, and environmental setting.
+    * Determine core visual elements and potential noise elements.
+2.  **Analyze the Modification Text ($T_m$)**:
+    * Extract explicit instructions: additions, removals, attribute changes.
+    * Identify implicit requirements: perspective shifts (viewpoint, scale), theme changes, causal implications.
+    * Detect potential conflicts between modification intent and reference elements.
+
+---------------------------------------------
+### **Step 2: Generate Query 1 - The Conservative Path ($Q_{conservative}$)**
+This path follows a Minimal Core Hypothesis: It prioritizes the explicit modification ($T_m$) and core subject, assuming most other reference ($I_r$) context is irrelevant.
+1.  **Reasoning Strategy (Minimal Core Hypothesis)**:
+    * Start with the content **explicitly described in $T_m$**.
+    * Identify and include *only* the **absolute essential subject(s)** from $I_r$ that are necessary for $T_m$ to be meaningful.
+    * **Assume high potential for conflict or irrelevance**: Aggressively **exclude nearly all other contextual and attribute details** from $I_r$, particularly if any spatial/viewpoint/scale shift is detected in $T_m$.
+    * This path represents a "safe" interpretation focusing purely on the modification and core entity.
+2.  **Generate $Q_{conservative}$**: Create a concise description based on this **minimal core hypothesis** after thinking step-by-step, adhering to the Universal Principles in Step 5.
+
+---------------------------------------------
+### **Step 3: Generate Query 2 - The Balanced Path ($Q_{balanced}$)**
+This path follows a **Standard Filtering Hypothesis**: It assumes the user intends a direct application of $T_m$ while removing all clear and implicit contradictions.
+1.  **Reasoning Strategy (Standard Filtering Hypothesis)**:
+    * Apply all explicit modifications from $T_m$ precisely.
+    * Remove reference elements that **directly and obviously conflict** with $T_m$ (primarily thematic or clear attribute contradictions).
+    * **Exclude reference elements whose necessity or compatibility is unclear** after applying explicit changes.
+    * Focus on creating a **clean, conflict-free description** based on this direct compatibility check, without deep inference about implicit spatial/causal effects.
+2.  **Generate $Q_{balanced}$**: Create a concise description based on this **standard filtering hypothesis** after thinking step-by-step, adhering to the Universal Principles in Step 5.
+
+---------------------------------------------
+### **Step 4: Generate Query 3 - The Reasoning-Enhanced Path ($Q_{reasoning}$)**
+This path follows a **Coherent Inference Hypothesis**: It assumes the user desires a logically consistent and contextually plausible scene, requiring inference about the implicit consequences of $T_m$.
+1.  **Reasoning Strategy (Coherent Inference Hypothesis)**:
+    * Apply all explicit modifications from $T_m$.
+    * **Actively infer plausible consequences**: Analyze $T_m$ for implicit triggers (spatial, causal, thematic). Reason about their likely effects on the scene's composition and element visibility (e.g., significant perspective changes often alter what background elements are visible).
+    * **Modify based on inference**: Proactively remove $I_r$ elements that become logically implausible due to inferred consequences. Retain $I_r$ context *only if* it remains plausible within the inferred target scene. Consider if the inferred theme or action suggests plausible addition/modification of related elements grounded in the input.
+    * This path explores a more deeply reasoned interpretation striving for logical and contextual coherence.
+2.  **Generate $Q_{reasoning}$**: Create a concise description based on this **inference-driven hypothesis** after thinking step-by-step, adhering to the Universal Principles in Step 5.
+
+---------------------------------------------
+### **Step 5: Universal Generation Principles**
+All three queries MUST strictly adhere to these principles:
+1.  **Completeness**: The target image description should be complete and can cover various semantic aspects, such as cardinality, addition, negation, direct addressing, compare & change, comparative, conjunction, spatial relations & background, viewpoint.
+2.  **Simplicity**: The target image description only contain the target image content and needs to be as simple as possible. The instruction does not need to explicitly indicate which type it is.
+3.  **Objectivity**: Minimize aesthetic descriptions as much as possible.
+4.  **Conciseness**: For each target image, generate exactly three distinct descriptions (one from each reasoning path). Each description must be a single, concise sentence and kept as short as possible.
+5.  **Factual Accuracy**: Ensure the description accurately reflects the intended modifications.
+6.  **Conflict Avoidance**: Do not mention content that will not be present in the target image.
+7. Specifically, all three descriptions must represent plausible, coherent interpretations of the combined multi-modal input ($I_r$ + $T_m$). They are designed to explore different hypotheses of user intent, but none must ever contradict the explicit instructions in $T_m$.
+
+## On the input format <Input>
+- Input consist of two parts: The reference image and the modification text.
+{
+    "Reference Image": <image_url>,
+    "Modification Text": <modification_text>.
+}
+
+    - The reference image is a URL provided in the image_url field of the user content data type, which furnishes the content of the reference image.
+    - The modification instructions is the text that describes the changes to be made to the reference image.
+
+## Guidelines on determining the response <Response>
+- Response is a JSON object containing the three generated queries with brief rationales.
+{
+    "Conservative Query": {
+        "description": "<Target Image Description from Step 2>",
+        "rationale": "Brief explanation of conservative approach"
+    },
+    "Balanced Query": {
+        "description": "<Target Image Description from Step 3>", 
+        "rationale": "Brief explanation of balanced approach"
+    },
+    "Reasoning Enhanced Query": {
+        "description": "<Target Image Description from Step 4>",
+        "rationale": "Brief explanation of reasoning-enhanced approach"
+    }
+}
+
+
+Here are some more examples for reference:
+
+## Example 1
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "has only one person wearing the same outfit, the photo is zoomed in."
+}
+<Response>
+{
+    "Conservative Query": {
+        "description": "A close-up of one man wearing a red tie.",
+        "rationale": "This query focuses only on the explicit instructions ('one person', 'zoomed in') and the single retained element from the 'same outfit' (the red tie), ignoring all other context like shirt color or background."
+    },
+    "Balanced Query": {
+        "description": "A zoomed-in photo of one man wearing a white shirt and a red tie.", 
+        "rationale": "This query applies the 'one person' and 'zoomed in' instructions, assuming the original kitchen background is irrelevant. It retains the core components of the 'same outfit' (white shirt, red tie) from the reference image."
+    },
+    "Reasoning Enhanced Query": {
+        "description": "A close-up of a man's face with a pouty expression, wearing a white shirt and red tie.",
+        "rationale": "This query infers that 'zoomed in' implies a 'close-up' focusing on the person's 'face'. It follows 'one person', retains the 'same outfit' (white shirt, red tie), and hypothesizes a specific facial expression ('pouty expression') as a plausible detail for a close-up shot."
+    }
+}
+
+## Example 2
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "is damaged and has the same shape."
+}
+<Response>
+{
+    "Conservative Query": {
+        "description": "A damaged octagonal stop sign.",
+        "rationale": "This query only includes the essential subject (stop sign), the retained attribute (octagonal shape), and the explicit modification (damaged)."
+    },
+    "Balanced Query": {
+        "description": "A rusted stop sign with the same octagonal shape, surrounded by bushes.", 
+        "rationale": "This query interprets 'damaged' as a specific plausible type of damage ('rusted'). It retains the 'same shape' and removes the conflicting reference background (street signs, pole), hypothesizing a new plausible background ('surrounded by bushes')."
+    },
+    "Reasoning Enhanced Query": {
+        "description": "An old, rusted octagonal stop sign with faded letters, set in bushes.",
+        "rationale": "This query infers a coherent scene based on 'damaged'. 'Damaged' is interpreted as 'old' and 'rusted', which logically implies secondary effects like 'faded letters'. It replaces the reference background with a new, plausible setting ('set in bushes') consistent with a neglected sign."
+    }
+}
+
+## Example 3
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "A dog of a different breed shown with a jolly roger."
+}
+<Response>
+{
+    "Conservative Query": {
+        "description": "A dog of a different breed shown with a jolly roger.",
+        "rationale": "This query focuses only on the explicit instructions: replacing the dog's breed and adding the jolly roger symbol. It discards all other context from the reference image, such as the hat and the basket."
+    },
+    "Balanced Query": {
+        "description": "A dog of a different breed wearing a hat with a jolly roger.", 
+        "rationale": "This query applies the 'different breed' instruction and infers that the 'jolly roger' (pirate theme) directly conflicts with and replaces the reference image's 'cowboy hat'. It removes the non-essential basket context."
+    },
+    "Reasoning Enhanced Query": {
+        "description": "A dog of a different breed in a pirate costume with a jolly roger hat, next to a jug.",
+        "rationale": "This query infers that 'jolly roger' implies a full thematic change from 'cowboy' to 'pirate'. This justifies replacing all cowboy-related items (hat, garment) with a pirate costume and hat, and adding a thematically-related object like a jug."
+    }
+}
+
+## Example 4
+<Input>
+{
+    "Reference Image": <image_url>,
+    "Modification Text": "shows the cork on a table and has a more everyday background."
+}
+<Response>
+{
+    "Conservative Query": {
+        "description": "A glass of wine, a wine bottle, and a cork on a table.",
+        "rationale": "This query retains only the essential subjects from the reference (glass, bottle) and adds the elements explicitly requested by the modification (cork, table). It aggressively discards all other context like brand, bottle color, and background."
+    },
+    "Balanced Query": {
+        "description": "A glass of red wine, a wine bottle, and a cork on a table with an everyday background.", 
+        "rationale": "This query applies the modifications (cork, table, everyday background) and filters out conflicting reference elements. The 'plain background' is replaced, and the specific 'Javelina Leap' brand is assumed to be non-essential context and is discarded."
+    },
+    "Reasoning Enhanced Query": {
+        "description": "An etched glass of red wine, a matching branded bottle, and its cork on a table with an indoor background.",
+        "rationale": "This query infers that 'shows the cork' and 'everyday background' imply a new, complete, and coherent scene. It reasons that the 'cork' must match the 'bottle', and that the 'glass' would also be part of this branded set (etched), thus replacing all specific brand context from the reference."
+    }
+}
+'''
+
