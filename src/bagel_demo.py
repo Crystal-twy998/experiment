@@ -1,43 +1,51 @@
 #!/usr/bin/env python3
 """
-Minimal BAGEL demo for CIRR-style image editing.
+Single-sample BAGEL demo aligned with the current experiment/src codebase.
 
-This script follows the official BAGEL GitHub loading path and inference flow,
-then adds two simple steps for your test case:
-1) Generate a target-image description from the reference image + edit instruction.
-2) Generate the edited target image.
+What this script does:
+1. Loads BAGEL through experiment/src/bagel_inference.py (BagelImageEditor).
+2. Loads unified prompts from experiment/src/prompts.py.
+3. Runs four stage-1 prompt modes on one sample:
+   - structural_modifier_prompt                (caption + instruction)
+   - mllm_structural_predictor_prompt_CoT      (image + instruction)
+   - image_mllm_structural_predictor_prompt_CoT(image + instruction)
+   - mllm_structural_predictor_prompt_CoT_multi(image + instruction)
+4. Saves raw outputs, parsed descriptions, and optional edited images for analysis.
 
-Expected usage:
-    python demo_bagel_cirr_edit.py \
-        --repo_root /path/to/BAGEL_repo \
-        --model_path /nativemm/share/cpfs/tangwenyue/models/BAGEL \
-        --image_path /nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRR/test1/test1-147-1-img1.png
-
-Notes:
-- This script assumes you have already cloned the official BAGEL repository:
-  https://github.com/ByteDance-Seed/BAGEL
-- It also assumes the checkpoint directory contains files like:
-  ema.safetensors, ae.safetensors, llm_config.json, vit_config.json, config.json, etc.
-- For a first smoke test, mode=2 (NF4) is usually easier on VRAM.
+This is intentionally a single-sample analysis tool rather than the batch pipeline in utils.py.
 """
-
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import random
+import re
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
 import torch
 
 
+PROMPT_MODE_TO_NAME = {
+    "structural_modifier": "structural_modifier_prompt",
+    "mllm_cot": "mllm_structural_predictor_prompt_CoT",
+    "image_mllm_cot": "image_mllm_structural_predictor_prompt_CoT",
+    "mllm_cot_multi": "mllm_structural_predictor_prompt_CoT_multi",
+}
+
+MULTI_KEY_ALIASES = {
+    "conservative": ["Conservative Query"],
+    "balanced": ["Balanced Query"],
+    "reasoning": ["Reasoning Enhanced Query", "Reasoning-Enhanced Query", "Reasoning Query"],
+}
+
+
 def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -49,439 +57,356 @@ def set_seed(seed: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Simple BAGEL demo for CIRR-style editing")
+    parser = argparse.ArgumentParser(description="Single-sample BAGEL demo aligned to experiment/src")
+    parser.add_argument("--repo_src_root", type=str, required=True,
+                        help="Path to experiment/src directory.")
+    parser.add_argument("--model_path", type=str, required=True,
+                        help="Local BAGEL checkpoint directory.")
+    parser.add_argument("--image_path", type=str, required=True,
+                        help="Reference image path.")
+    parser.add_argument("--image_caption", type=str, default="",
+                        help="Reference image caption for structural_modifier mode.")
+    parser.add_argument("--edit_instruction", type=str, required=True,
+                        help="Relative caption / edit instruction.")
+    parser.add_argument("--reference_id", type=str, default="sample",
+                        help="Sample id for bookkeeping.")
+    parser.add_argument("--output_dir", type=str, default="./bagel_demo_outputs_latest")
     parser.add_argument(
-        "--repo_root",
+        "--prompt_modes",
+        nargs="+",
+        default=["structural_modifier", "mllm_cot", "image_mllm_cot", "mllm_cot_multi"],
+        choices=list(PROMPT_MODE_TO_NAME.keys()),
+    )
+    parser.add_argument("--multi_query_choice", type=str, default="conservative",
+                        choices=["conservative", "balanced", "reasoning"],
+                        help="Which multi-query branch to use when optionally generating the edited image.")
+    parser.add_argument("--generate_images", action="store_true",
+                        help="Also generate edited images using edit_image_no_think.")
+    parser.add_argument(
+        "--image_edit_prompt_mode",
         type=str,
-        default=None,
-        help="Path to the official BAGEL GitHub repo root. If omitted, current working directory is used.",
+        default="instruction_plus_target",
+        choices=["instruction_only", "target_text_only", "instruction_plus_target"],
+        help="Prompt composition for the optional edited-image generation step.",
     )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="/nativemm/share/cpfs/tangwenyue/models/BAGEL",
-        help="Local BAGEL checkpoint directory.",
-    )
-    parser.add_argument(
-        "--image_path",
-        type=str,
-        default="/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRCO/COCO2017_unlabeled/unlabeled2017/000000271520.jpg",
-        help="Reference image path.",
-    )
-    parser.add_argument(
-        "--image_caption",
-        type=str,
-        default="A performer in traditional costume holds an orange parasol on a dimly lit stage.",
-        help="Reference image caption.",
-    )
-    parser.add_argument(
-        "--edit_instruction",
-        type=str,
-        default="shows two people and has a more colorful background",
-        help="Edit instruction / relative caption.",
-    )
-    parser.add_argument(
-        "--reference_id",
-        type=str,
-        default="test1-147-1-img1",
-        help="Reference image ID for bookkeeping.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./bagel_demo_outputs",
-        help="Directory to save generated text and image.",
-    )
-    parser.add_argument(
-        "--mode",
-        type=int,
-        default=2,
-        choices=[1, 2, 3],
-        help="1=bf16 full weights, 2=NF4 quantized, 3=INT8 quantized.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed.",
-    )
-    parser.add_argument(
-        "--max_memory_per_gpu",
-        type=str,
-        default="40GiB",
-        help="Max memory string passed to accelerate device_map, e.g. 24GiB / 40GiB / 80GiB.",
-    )
+    parser.add_argument("--max_think_token_n", type=int, default=512)
+    parser.add_argument("--do_sample", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_mem_per_gpu", type=str, default="40GiB")
+    parser.add_argument("--offload_folder", type=str, default="/tmp/offload_bagel_demo")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Optional device override, e.g. cuda:0")
+    parser.add_argument("--use_multi_gpu", action="store_true")
     parser.add_argument("--cfg_text_scale", type=float, default=4.0)
     parser.add_argument("--cfg_img_scale", type=float, default=2.0)
-    parser.add_argument("--cfg_interval", type=float, default=0.0)
+    parser.add_argument("--cfg_interval_start", type=float, default=0.0)
+    parser.add_argument("--cfg_interval_end", type=float, default=1.0)
     parser.add_argument("--timestep_shift", type=float, default=3.0)
     parser.add_argument("--num_timesteps", type=int, default=50)
     parser.add_argument("--cfg_renorm_min", type=float, default=0.0)
-    parser.add_argument(
-        "--cfg_renorm_type",
-        type=str,
-        default="text_channel",
-        choices=["global", "channel", "text_channel"],
-    )
-    parser.add_argument(
-        "--also_text2image",
-        action="store_true",
-        help="Also generate a pure text-to-image sample from the generated target description.",
-    )
+    parser.add_argument("--cfg_renorm_type", type=str, default="text_channel",
+                        choices=["global", "channel", "text_channel"])
     return parser.parse_args()
 
 
-def import_bagel_modules(repo_root: str | None):
-    """Import BAGEL modules from the official repo root, avoiding name collisions.
+def load_module_from_path(module_name: str, file_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module {module_name} from {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    Important: when this script is launched inside another project (e.g. WISER),
-    Python may otherwise import that project's local `data/` or `modeling/`
-    packages instead of BAGEL's own modules.
-    """
-    if repo_root is None:
-        repo_root = os.getcwd()
-    repo_root = os.path.abspath(repo_root)
 
-    required = [
-        os.path.join(repo_root, 'inferencer.py'),
-        os.path.join(repo_root, 'data'),
-        os.path.join(repo_root, 'modeling'),
-    ]
-    missing = [x for x in required if not os.path.exists(x)]
-    if missing:
-        raise FileNotFoundError(
-            'repo_root does not look like the official BAGEL repo root. Missing: ' + ', '.join(missing)
-        )
+def import_repo_modules(repo_src_root: Path):
+    if not repo_src_root.exists():
+        raise FileNotFoundError(f"repo_src_root not found: {repo_src_root}")
+    sys.path.insert(0, str(repo_src_root))
+    bagel_inference = load_module_from_path("bagel_inference_local", repo_src_root / "bagel_inference.py")
+    prompts_module = load_module_from_path("prompts_local", repo_src_root / "prompts.py")
+    return bagel_inference, prompts_module
 
-    # Make BAGEL repo highest priority.
-    if repo_root in sys.path:
-        sys.path.remove(repo_root)
-    sys.path.insert(0, repo_root)
 
-    # Remove current working directory / script directory if they point to another
-    # project that may also contain `data` or `modeling` packages.
-    script_dir = os.path.abspath(os.path.dirname(__file__))
-    cwd = os.path.abspath(os.getcwd())
-    cleaned = []
-    for p in sys.path[1:]:
-        ap = os.path.abspath(p or cwd)
-        if ap in {script_dir, cwd} and ap != repo_root:
-            continue
-        cleaned.append(p)
-    sys.path[:] = [repo_root] + cleaned
+def ensure_serializable(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): ensure_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [ensure_serializable(v) for v in value]
+    return str(value)
 
-    try:
-        from accelerate import infer_auto_device_map, load_checkpoint_and_dispatch, init_empty_weights
-        from accelerate.utils import BnbQuantizationConfig, load_and_quantize_model
 
-        from data.data_utils import add_special_tokens, pil_img2rgb
-        from data.transforms import ImageTransform
-        from inferencer import InterleaveInferencer
-        from modeling.autoencoder import load_ae
-        from modeling.bagel.qwen2_navit import NaiveCache  # noqa: F401  # imported for side effects / parity
-        from modeling.bagel import (
-            BagelConfig,
-            Bagel,
-            Qwen2Config,
-            Qwen2ForCausalLM,
-            SiglipVisionConfig,
-            SiglipVisionModel,
-        )
-        from modeling.qwen2 import Qwen2Tokenizer
-    except Exception as e:
-        raise ImportError(
-            "Failed to import BAGEL official repo modules. "
-            "Please clone https://github.com/ByteDance-Seed/BAGEL and pass --repo_root /path/to/BAGEL, "
-            "or place this script under the BAGEL repo root before running. "
-            f"Original error: {e}"
-        ) from e
+def extract_json_substring(text: str) -> Optional[str]:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
 
-    return {
-        "infer_auto_device_map": infer_auto_device_map,
-        "load_checkpoint_and_dispatch": load_checkpoint_and_dispatch,
-        "init_empty_weights": init_empty_weights,
-        "BnbQuantizationConfig": BnbQuantizationConfig,
-        "load_and_quantize_model": load_and_quantize_model,
-        "add_special_tokens": add_special_tokens,
-        "pil_img2rgb": pil_img2rgb,
-        "ImageTransform": ImageTransform,
-        "InterleaveInferencer": InterleaveInferencer,
-        "load_ae": load_ae,
-        "BagelConfig": BagelConfig,
-        "Bagel": Bagel,
-        "Qwen2Config": Qwen2Config,
-        "Qwen2ForCausalLM": Qwen2ForCausalLM,
-        "SiglipVisionConfig": SiglipVisionConfig,
-        "SiglipVisionModel": SiglipVisionModel,
-        "Qwen2Tokenizer": Qwen2Tokenizer,
+
+def parse_single_description(raw_text: str) -> Dict[str, Any]:
+    text = (raw_text or "").strip()
+    result: Dict[str, Any] = {
+        "raw_text": text,
+        "parsed_description": "",
+        "parser": "fallback",
     }
+    if not text:
+        return result
+
+    for key in ["Edited Description", "Target Image Description"]:
+        pattern = rf'{re.escape(key)}\s*[:：]\s*(.+)'
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            result["parsed_description"] = m.group(1).strip().strip('"')
+            result["parser"] = f"line_prefix:{key}"
+            return result
+
+    json_block = extract_json_substring(text)
+    if json_block:
+        try:
+            obj = json.loads(json_block)
+            for key in ["Edited Description", "Target Image Description"]:
+                if isinstance(obj, dict) and key in obj and isinstance(obj[key], str):
+                    result["parsed_description"] = obj[key].strip()
+                    result["parser"] = f"json:{key}"
+                    result["json"] = obj
+                    return result
+        except Exception:
+            pass
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        result["parsed_description"] = lines[-1]
+        result["parser"] = "last_nonempty_line"
+    return result
 
 
-def build_inferencer(args: argparse.Namespace, mods: Dict[str, Any]):
-    if not torch.cuda.is_available():
-        raise RuntimeError("BAGEL demo currently expects at least one CUDA GPU.")
+def parse_multi_queries(raw_text: str) -> Dict[str, Any]:
+    text = (raw_text or "").strip()
+    result: Dict[str, Any] = {
+        "raw_text": text,
+        "queries": {},
+        "parser": "unparsed",
+    }
+    if not text:
+        return result
 
-    model_path = args.model_path
-    if not os.path.isdir(model_path):
-        raise FileNotFoundError(f"Model path not found: {model_path}")
+    json_block = extract_json_substring(text)
+    if json_block:
+        try:
+            obj = json.loads(json_block)
+            if isinstance(obj, dict):
+                result["queries"] = obj
+                result["parser"] = "json"
+                return result
+        except Exception:
+            pass
 
-    Qwen2Config = mods["Qwen2Config"]
-    SiglipVisionConfig = mods["SiglipVisionConfig"]
-    BagelConfig = mods["BagelConfig"]
-    Qwen2ForCausalLM = mods["Qwen2ForCausalLM"]
-    SiglipVisionModel = mods["SiglipVisionModel"]
-    Bagel = mods["Bagel"]
-    load_ae = mods["load_ae"]
-    Qwen2Tokenizer = mods["Qwen2Tokenizer"]
-    add_special_tokens = mods["add_special_tokens"]
-    ImageTransform = mods["ImageTransform"]
-    InterleaveInferencer = mods["InterleaveInferencer"]
-    infer_auto_device_map = mods["infer_auto_device_map"]
-    load_checkpoint_and_dispatch = mods["load_checkpoint_and_dispatch"]
-    init_empty_weights = mods["init_empty_weights"]
-    BnbQuantizationConfig = mods["BnbQuantizationConfig"]
-    load_and_quantize_model = mods["load_and_quantize_model"]
+    # Regex fallback for semi-structured outputs.
+    patterns = {
+        "Conservative Query": r'Conservative Query.*?description\s*[:：]\s*"?([^"\n]+)"?.*?rationale\s*[:：]\s*"?([^"\n]+)"?',
+        "Balanced Query": r'Balanced Query.*?description\s*[:：]\s*"?([^"\n]+)"?.*?rationale\s*[:：]\s*"?([^"\n]+)"?',
+        "Reasoning Enhanced Query": r'Reasoning[ -]?Enhanced Query.*?description\s*[:：]\s*"?([^"\n]+)"?.*?rationale\s*[:：]\s*"?([^"\n]+)"?',
+    }
+    queries = {}
+    for key, pattern in patterns.items():
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            queries[key] = {
+                "description": m.group(1).strip(),
+                "rationale": m.group(2).strip(),
+            }
+    if queries:
+        result["queries"] = queries
+        result["parser"] = "regex"
+    return result
 
-    print(f"[BAGEL] Loading from: {model_path}")
-    print(f"[BAGEL] CUDA device count: {torch.cuda.device_count()}")
 
-    llm_config = Qwen2Config.from_json_file(os.path.join(model_path, "llm_config.json"))
-    llm_config.qk_norm = True
-    llm_config.tie_word_embeddings = False
-    llm_config.layer_module = "Qwen2MoTDecoderLayer"
+def get_prompt_text(prompts_module, prompt_name: str) -> str:
+    if not hasattr(prompts_module, prompt_name):
+        raise AttributeError(f"Prompt {prompt_name} not found in prompts.py")
+    prompt = getattr(prompts_module, prompt_name)
+    if not isinstance(prompt, str):
+        raise TypeError(f"Prompt {prompt_name} is not a string")
+    return prompt
 
-    vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
-    vit_config.rope = False
-    vit_config.num_hidden_layers -= 1
 
-    vae_model, vae_config = load_ae(local_path=os.path.join(model_path, "ae.safetensors"))
+def build_caption_prompt(base_prompt: str, image_caption: str, edit_instruction: str) -> str:
+    return base_prompt + "\n" + f"Image Content: {image_caption}" + "\n" + f"Instruction: {edit_instruction}"
 
-    config = BagelConfig(
-        visual_gen=True,
-        visual_und=True,
-        llm_config=llm_config,
-        vit_config=vit_config,
-        vae_config=vae_config,
-        vit_max_num_patch_per_side=70,
-        connector_act="gelu_pytorch_tanh",
-        latent_patch_size=2,
-        max_latent_size=64,
+
+def build_image_understanding_prompt(base_prompt: str, edit_instruction: str) -> str:
+    return base_prompt + "\n" + f"Modification Text: {edit_instruction}"
+
+
+def build_image_edit_prompt(mode: str, instruction: str, target_text: str) -> str:
+    if mode == "instruction_only":
+        return instruction
+    if mode == "target_text_only":
+        return target_text
+    return (
+        "Edit this reference image according to the modification text and the desired final target description.\n"
+        f"Modification Text: {instruction}\n"
+        f"Target Image Description: {target_text}"
     )
 
-    with init_empty_weights():
-        language_model = Qwen2ForCausalLM(llm_config)
-        vit_model = SiglipVisionModel(vit_config)
-        model = Bagel(language_model, vit_model, config)
-        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
 
-    tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
-    tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
-
-    vae_transform = ImageTransform(1024, 512, 16)
-    vit_transform = ImageTransform(980, 224, 14)
-
-    max_memory = {i: args.max_memory_per_gpu for i in range(torch.cuda.device_count())}
-    device_map = infer_auto_device_map(
-        model,
-        max_memory=max_memory,
-        no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
-    )
-
-    same_device_modules = [
-        "language_model.model.embed_tokens",
-        "time_embedder",
-        "latent_pos_embed",
-        "vae2llm",
-        "llm2vae",
-        "connector",
-        "vit_pos_embed",
-    ]
-
-    if torch.cuda.device_count() == 1:
-        first_device = device_map.get(same_device_modules[0], "cuda:0")
-        for k in same_device_modules:
-            device_map[k] = first_device
-    else:
-        first_device = device_map.get(same_device_modules[0], "cuda:0")
-        for k in same_device_modules:
-            device_map[k] = first_device
-
-    checkpoint_path = os.path.join(model_path, "ema.safetensors")
-    if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    if args.mode == 1:
-        model = load_checkpoint_and_dispatch(
-            model,
-            checkpoint=checkpoint_path,
-            device_map=device_map,
-            offload_buffers=True,
-            offload_folder=os.path.join(args.output_dir, "offload"),
-            dtype=torch.bfloat16,
-            force_hooks=True,
-        ).eval()
-    elif args.mode == 2:
-        bnb_quantization_config = BnbQuantizationConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=False,
-            bnb_4bit_quant_type="nf4",
-        )
-        model = load_and_quantize_model(
-            model,
-            weights_location=checkpoint_path,
-            bnb_quantization_config=bnb_quantization_config,
-            device_map=device_map,
-            offload_folder=os.path.join(args.output_dir, "offload"),
-        ).eval()
-    else:
-        bnb_quantization_config = BnbQuantizationConfig(
-            load_in_8bit=True,
-            torch_dtype=torch.float32,
-        )
-        model = load_and_quantize_model(
-            model,
-            weights_location=checkpoint_path,
-            bnb_quantization_config=bnb_quantization_config,
-            device_map=device_map,
-            offload_folder=os.path.join(args.output_dir, "offload"),
-        ).eval()
-
-    inferencer = InterleaveInferencer(
-        model=model,
-        vae_model=vae_model,
-        tokenizer=tokenizer,
-        vae_transform=vae_transform,
-        vit_transform=vit_transform,
-        new_token_ids=new_token_ids,
-    )
-    return inferencer
+def run_text_only_prompt(editor, prompt_text: str, max_think_token_n: int, do_sample: bool) -> str:
+    return editor.generate_caption(prompt_text, max_think_token_n=max_think_token_n, do_sample=do_sample)
 
 
-def generate_target_description(inferencer, ref_image: Image.Image, edit_instruction: str) -> str:
-    prompt = (
-        "Given the reference image and the editing instruction, describe the FINAL target image in one concise sentence. "
-        "Only describe the edited result, not the original image, and do not explain your reasoning.\n"
-        f"Editing instruction: {edit_instruction}"
-    )
-
-    result = inferencer(
-        image=ref_image,
-        text=prompt,
-        think=False,
+def run_image_conditioned_prompt(editor, image: Image.Image, prompt_text: str,
+                                 max_think_token_n: int, do_sample: bool) -> str:
+    output_dict = editor.inferencer(
+        image=image,
+        text=prompt_text,
         understanding_output=True,
-        do_sample=False,
-        text_temperature=0.3,
-        max_think_token_n=128,
+        max_think_token_n=max_think_token_n,
+        do_sample=do_sample,
     )
-    text = (result.get("text") or "").strip()
-    return text
+    return (output_dict.get("text") or "").strip()
 
 
-def edit_target_image(inferencer, ref_image: Image.Image, edit_instruction: str, target_description: str, args: argparse.Namespace):
-    prompt = (
-        "Edit this image according to the instruction below. "
-        "Preserve the scene as much as possible except for the requested changes.\n"
-        f"Instruction: {edit_instruction}\n"
-        f"Desired final image: {target_description}"
-    )
-
-    result = inferencer(
-        image=ref_image,
-        text=prompt,
-        think=False,
-        cfg_text_scale=args.cfg_text_scale,
-        cfg_img_scale=args.cfg_img_scale,
-        cfg_interval=[args.cfg_interval, 1.0],
-        timestep_shift=args.timestep_shift,
-        num_timesteps=args.num_timesteps,
-        cfg_renorm_min=args.cfg_renorm_min,
-        cfg_renorm_type=args.cfg_renorm_type,
-    )
-    return result.get("image")
+def select_multi_query(multi_result: Dict[str, Any], choice: str) -> Optional[Dict[str, Any]]:
+    queries = multi_result.get("queries") or {}
+    for key in MULTI_KEY_ALIASES[choice]:
+        if key in queries and isinstance(queries[key], dict):
+            desc = queries[key].get("description", "")
+            rationale = queries[key].get("rationale", "")
+            return {"key": key, "description": desc, "rationale": rationale}
+    return None
 
 
-def text_to_image_from_description(inferencer, target_description: str) -> Image.Image | None:
-    result = inferencer(
-        text=target_description,
-        think=False,
-        cfg_text_scale=4.0,
-        cfg_interval=[0.4, 1.0],
-        timestep_shift=3.0,
-        num_timesteps=50,
-        cfg_renorm_min=0.0,
-        cfg_renorm_type="global",
-        image_shapes=(1024, 1024),
-    )
-    return result.get("image")
+def save_text(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
 
 
 def main() -> None:
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "offload"), exist_ok=True)
-
     set_seed(args.seed)
 
-    mods = import_bagel_modules(args.repo_root)
-    pil_img2rgb = mods["pil_img2rgb"]
+    repo_src_root = Path(args.repo_src_root).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_path = Path(args.image_path)
+    bagel_inference, prompts_module = import_repo_modules(repo_src_root)
+    BagelImageEditor = bagel_inference.BagelImageEditor
+
+    image_path = Path(args.image_path).resolve()
     if not image_path.exists():
         raise FileNotFoundError(f"Reference image not found: {image_path}")
+    ref_image = Image.open(image_path).convert("RGB")
 
-    ref_image = pil_img2rgb(Image.open(image_path).convert("RGB"))
-    inferencer = build_inferencer(args, mods)
+    editor = BagelImageEditor(
+        model_path=args.model_path,
+        max_mem_per_gpu=args.max_mem_per_gpu,
+        offload_folder=args.offload_folder,
+        device=args.device,
+        use_multi_gpu=args.use_multi_gpu,
+    )
 
-    print("\n[Step 1] Generating target-image description...")
-    target_description = generate_target_description(inferencer, ref_image, args.edit_instruction)
-    print(f"[Target Description] {target_description}")
-
-    print("\n[Step 2] Generating edited target image...")
-    edited_image = edit_target_image(inferencer, ref_image, args.edit_instruction, target_description, args)
-    if edited_image is None:
-        raise RuntimeError("Image editing returned None. Please check model loading and inference logs.")
-
-    description_path = os.path.join(args.output_dir, f"{args.reference_id}_target_description.txt")
-    edited_image_path = os.path.join(args.output_dir, f"{args.reference_id}_edited.png")
-
-    with open(description_path, "w", encoding="utf-8") as f:
-        f.write(target_description + "\n")
-    edited_image.save(edited_image_path)
-
-    metadata = {
-        "reference": args.reference_id,
-        "image_path": args.image_path,
-        "caption": args.edit_instruction,
-        "generated_target_description": target_description,
-        "edited_image_path": edited_image_path,
-        "mode": args.mode,
-        "seed": args.seed,
-        "cfg_text_scale": args.cfg_text_scale,
-        "cfg_img_scale": args.cfg_img_scale,
-        "cfg_interval": args.cfg_interval,
-        "timestep_shift": args.timestep_shift,
-        "num_timesteps": args.num_timesteps,
-        "cfg_renorm_min": args.cfg_renorm_min,
-        "cfg_renorm_type": args.cfg_renorm_type,
+    summary: Dict[str, Any] = {
+        "reference_id": args.reference_id,
+        "image_path": str(image_path),
+        "image_caption": args.image_caption,
+        "edit_instruction": args.edit_instruction,
+        "prompt_modes": args.prompt_modes,
+        "results": {},
     }
 
-    metadata_path = os.path.join(args.output_dir, f"{args.reference_id}_meta.json")
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    for mode in args.prompt_modes:
+        prompt_name = PROMPT_MODE_TO_NAME[mode]
+        base_prompt = get_prompt_text(prompts_module, prompt_name)
+        mode_dir = output_dir / mode
+        mode_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[Saved]")
-    print(f"- target text : {description_path}")
-    print(f"- edited image: {edited_image_path}")
-    print(f"- metadata    : {metadata_path}")
+        if mode == "structural_modifier":
+            if not args.image_caption.strip():
+                raise ValueError("--image_caption is required for structural_modifier mode.")
+            final_prompt = build_caption_prompt(base_prompt, args.image_caption, args.edit_instruction)
+            raw_output = run_text_only_prompt(editor, final_prompt, args.max_think_token_n, args.do_sample)
+            parsed = parse_single_description(raw_output)
+            chosen_target = parsed.get("parsed_description", "")
+            mode_result: Dict[str, Any] = {
+                "mode": mode,
+                "prompt_name": prompt_name,
+                "prompt_type": "text_only_caption_based",
+                "parsed": parsed,
+                "chosen_target_description": chosen_target,
+            }
+        elif mode == "mllm_cot_multi":
+            final_prompt = build_image_understanding_prompt(base_prompt, args.edit_instruction)
+            raw_output = run_image_conditioned_prompt(editor, ref_image, final_prompt, args.max_think_token_n, args.do_sample)
+            parsed_multi = parse_multi_queries(raw_output)
+            selected = select_multi_query(parsed_multi, args.multi_query_choice)
+            chosen_target = selected["description"] if selected else ""
+            mode_result = {
+                "mode": mode,
+                "prompt_name": prompt_name,
+                "prompt_type": "image_conditioned_multi_query",
+                "parsed": parsed_multi,
+                "selected_query": selected,
+                "chosen_target_description": chosen_target,
+            }
+        else:
+            final_prompt = build_image_understanding_prompt(base_prompt, args.edit_instruction)
+            raw_output = run_image_conditioned_prompt(editor, ref_image, final_prompt, args.max_think_token_n, args.do_sample)
+            parsed = parse_single_description(raw_output)
+            chosen_target = parsed.get("parsed_description", "")
+            mode_result = {
+                "mode": mode,
+                "prompt_name": prompt_name,
+                "prompt_type": "image_conditioned_single_query",
+                "parsed": parsed,
+                "chosen_target_description": chosen_target,
+            }
 
-    if args.also_text2image:
-        print("\n[Step 3] Generating an extra text-to-image sample from the target description...")
-        t2i_image = text_to_image_from_description(inferencer, target_description)
-        if t2i_image is not None:
-            t2i_path = os.path.join(args.output_dir, f"{args.reference_id}_t2i.png")
-            t2i_image.save(t2i_path)
-            print(f"- text-to-image sample: {t2i_path}")
+        save_text(mode_dir / "request_prompt.txt", final_prompt)
+        save_text(mode_dir / "raw_output.txt", raw_output)
+
+        if args.generate_images and chosen_target:
+            image_edit_prompt = build_image_edit_prompt(
+                args.image_edit_prompt_mode,
+                args.edit_instruction,
+                chosen_target,
+            )
+            image_result = editor.edit_image_no_think(
+                image_path=str(image_path),
+                prompt=image_edit_prompt,
+                cfg_text_scale=args.cfg_text_scale,
+                cfg_img_scale=args.cfg_img_scale,
+                cfg_interval=[args.cfg_interval_start, args.cfg_interval_end],
+                timestep_shift=args.timestep_shift,
+                num_timesteps=args.num_timesteps,
+                cfg_renorm_min=args.cfg_renorm_min,
+                cfg_renorm_type=args.cfg_renorm_type,
+            )
+            edited_image = image_result.get("image")
+            if edited_image is not None:
+                edited_path = mode_dir / f"edited_{args.reference_id}.png"
+                edited_image.save(edited_path)
+                mode_result["edited_image_path"] = str(edited_path)
+                save_text(mode_dir / "image_edit_prompt.txt", image_edit_prompt)
+
+        result_json_path = mode_dir / "result.json"
+        result_json_path.write_text(json.dumps(ensure_serializable(mode_result), indent=2, ensure_ascii=False), encoding="utf-8")
+        summary["results"][mode] = mode_result
+
+    (output_dir / "summary.json").write_text(
+        json.dumps(ensure_serializable(summary), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(json.dumps(ensure_serializable(summary), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
