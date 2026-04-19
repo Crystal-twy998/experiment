@@ -1,0 +1,82 @@
+[
+    {
+        "exp-name": "CIRCO test initial dual run",
+        "stage_mode": "qwen_fusion",
+        "topk_for_vqa": 50,
+        "preload": [
+            "captions",
+            "img_paths",
+            "edited_images",
+            "mods",
+            "img_features"
+        ],
+        "clip": "ViT-g-14",
+        "clip_choices": [
+            "ViT-bigG-14",
+            "ViT-B-32",
+            "ViT-B-16",
+            "ViT-L-14",
+            "ViT-H-14",
+            "ViT-g-14"
+        ],
+        "dataset": "circo",
+        "dataset_choices": [
+            "cirr",
+            "circo",
+            "fashioniq_dress",
+            "fashioniq_toptee",
+            "fashioniq_shirt"
+        ],
+        "split": "test",
+        "split_choices": [
+            "val",
+            "test"
+        ],
+        "dataset_path": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRCO",
+        "edit_img_dir": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRCO/Edited_Images",
+        "bagel_model_path": "/nativemm/share/cpfs/tangwenyue/models/BAGEL-7B-MoT",
+        "llm_prompt": "prompts.structural_modifier_prompt",
+        "openai_key": "",
+        "max_check_num": 1,
+        "initial_only": false,
+
+        "LLM_model_name": "bagel",
+        "LLM_model_name_choices": [
+            "bagel"
+        ],
+
+        "Check_LLM_model_name": "qwen2_5_vl_7b_instruct",
+        "Check_LLM_model_name_choices": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-3.5-turbo",
+            "qwen-turbo",
+            "qwen2_5_vl_7b_instruct",
+            "qwen3_vl_8b_instruct"
+        ],
+
+        "VQA_LLM_model_name": "qwen2_5_vl_7b_instruct",
+        "VQA_LLM_model_name_choices": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-3.5-turbo",
+            "qwen-turbo",
+            "qwen2_5_vl_7b_instruct",
+            "qwen2_5_vl_3b_instruct",
+            "qwen3_vl_8b_instruct"
+        ],
+
+        "retrieval": "default",
+
+        "preload_modified_captions_file": "circo_modified_captions.json",
+        "preload_image_captions_file": "CIRCO_blip2_t5_xxl_captions.csv",
+        "preload_image_paths_file": "CIRCO_image_paths.csv",
+        "preload_edited_images_file": "CIRCO_edited_images.pkl",
+        "preload_new_captions": "",
+        "preload_suggestions": "",
+        "preload_candidates": "",
+        "preload_pseudo_targets": "",
+
+        "task": "circo_test_dual_ada_fusion_qwen2_5"
+    }
+]
