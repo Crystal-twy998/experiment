@@ -186,3 +186,5 @@ class BagelImageEditor:
         }
         output_dict = self.inferencer(text=prompt, understanding_output=True, **inference_hyper)
         return output_dict['text']
+
+   
