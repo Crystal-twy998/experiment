@@ -239,9 +239,9 @@ def main():
     }
 
     dataset_image_path = {
-        "FASHIONIQ": "/data1/tangwenyue/Dataset/FashionIQ/images",
-        "CIRCO": "/data1/tangwenyue/Dataset/CIRCO/COCO2017_unlabeled/unlabeled2017",
-        "CIRR": "/data1/tangwenyue/Dataset/CIRR/test1",
+        "FASHIONIQ": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/FashionIQ/images",
+        "CIRCO": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRCO/COCO2017_unlabeled/unlabeled2017",
+        "CIRR": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRR/test1",
     }
 
     model_path = args.model_path or default_model_paths[args.model_variant]
@@ -251,7 +251,7 @@ def main():
     if output_csv is None:
         output_name = f"{args.dataset_name}_{args.captioner}_{args.model_variant}_captions.csv"
         output_csv = os.path.join(
-            "/data1/tangwenyue/Dataset",
+            "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets",
             args.dataset_name,
             "preload/image_captions",
             output_name,
