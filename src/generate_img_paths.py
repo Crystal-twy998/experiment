@@ -44,14 +44,15 @@ def main():
     args = parser.parse_args()
 
     DATASET_IMAGE_PATH = {
-        "FASHIONIQ": "/data1/tangwenyue/Dataset/FashionIQ/images",
-        "CIRCO": "/data1/tangwenyue/Dataset/CIRCO/COCO2017_unlabeled/unlabeled2017",
-        "CIRR": "/data1/tangwenyue/Dataset/CIRR/test1"
+        "FASHIONIQ": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/FashionIQ/images",
+        "CIRCO": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRCO/COCO2017_unlabeled/unlabeled2017",
+        # "CIRR": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRR/test1"
+        "CIRR": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRR/dev"
     }
 
     args.output_csv = f"{args.dataset_name}_image_paths.csv"
 
-    output_csv = os.path.join("/data1/tangwenyue/Dataset", args.dataset_name, "preload/image_paths", args.output_csv)
+    output_csv = os.path.join("/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets", args.dataset_name, "preload/image_paths", args.output_csv)
 
     generate_image_paths(DATASET_IMAGE_PATH[args.dataset_name], output_csv, args.batch_size, args.device)
 
