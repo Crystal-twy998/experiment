@@ -103,6 +103,60 @@ def _clip_prefix(clip_name: Optional[str]) -> str:
     return f"{clip_tag}_" if clip_tag else ""
 
 
+
+
+def _extract_target_image_description(resp_text: str) -> str:
+    """Extract the primary target description from BAGEL text output."""
+    if resp_text is None:
+        return ""
+    if not isinstance(resp_text, str):
+        resp_text = str(resp_text)
+
+    lines = [line.strip() for line in resp_text.splitlines() if line.strip()]
+    prefixes = [
+        'Edited Description:',
+        'Target Image Description:',
+        '"Edited Description":',
+        '"Target Image Description":',
+    ]
+    for line in lines:
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                value = line.split(':', 1)[1].strip().strip(',').strip().strip('"').strip("'")
+                if value:
+                    return value
+
+    patterns = [
+        r'"Target Image Description"\s*:\s*"([^"]+)"',
+        r"'Target Image Description'\s*:\s*'([^']+)'",
+        r'"Edited Description"\s*:\s*"([^"]+)"',
+        r"'Edited Description'\s*:\s*'([^']+)'",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, resp_text, flags=re.DOTALL)
+        if m:
+            value = m.group(1).strip()
+            if value:
+                return value
+    return ""
+
+
+def _build_stage1_image_edit_prompt(image_generation_mode: str, instruction: str, target_caption: str) -> str:
+    instruction = (instruction or "").strip()
+    target_caption = (target_caption or "").strip()
+    if image_generation_mode == "instruction_only":
+        return instruction
+    if image_generation_mode == "target_only":
+        return target_caption if target_caption else instruction
+    if image_generation_mode == "instruction_plus_target":
+        if target_caption:
+            return (
+                f"Modify the reference image according to this instruction: {instruction}\n"
+                f"The draft edited image description is: {target_caption}"
+            )
+        return instruction
+    raise ValueError(f"Unsupported image_generation_mode: {image_generation_mode}")
+
 def _build_verifier_prefix(clip_name: str, check_model_name: str, model_name: str) -> str:
     clip_tag = _sanitize_tag(clip_name) if clip_name is not None else "clip"
     check_tag = _sanitize_tag(check_model_name)
@@ -443,6 +497,8 @@ def generate_editimg_caption_iteration(
 
         all_edit_img_paths.append(chosen_path)
 
+    image_generation_mode = getattr(args, "image_generation_mode", "instruction_only")
+
     if len(missing_edit_indices) > 0:
         _require_bagel("edited images", edit_meta_path)
         local_missing_edit_indices = [i for i in missing_edit_indices if i in local_gen_set]
@@ -450,16 +506,23 @@ def generate_editimg_caption_iteration(
             f"[BAGEL] Missing edited images: {len(missing_edit_indices)} total, "
             f"{len(local_missing_edit_indices)} on this rank. Generating with BAGEL..."
         )
+        print(f"[BAGEL] image_generation_mode = {image_generation_mode}")
 
         edit_iter = tqdm.tqdm(local_missing_edit_indices, total=len(local_missing_edit_indices), desc="Editing images...")
         for i in edit_iter:
             ref_img_path = ref_img_paths[i]
             rel_caption = relative_captions[i]
+            target_caption = modified_captions[i]
+            image_edit_prompt = _build_stage1_image_edit_prompt(
+                image_generation_mode=image_generation_mode,
+                instruction=rel_caption,
+                target_caption=target_caption,
+            )
             save_path = expected_edit_img_paths[i]
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
             if not os.path.exists(save_path):
-                edited_out = bagel_editor.edit_image_no_think(ref_img_path, rel_caption)
+                edited_out = bagel_editor.edit_image_no_think(ref_img_path, image_edit_prompt)
 
                 if isinstance(edited_out, dict):
                     if "image" not in edited_out:
@@ -497,7 +560,9 @@ def generate_editimg_caption_iteration(
                         "relative_captions": relative_captions,
                         "target_names": target_names,
                         "reference_names": reference_names,
-                        "query_ids": query_ids
+                        "query_ids": query_ids,
+                        "modified_captions": modified_captions,
+                        "image_generation_mode": image_generation_mode,
                     },
                     f
                 )
@@ -795,12 +860,7 @@ def LLM_remodify_editimg_caption(bagel_editor, LLM_model_name, llm_prompt_args, 
                 Instruction: {instruction}.
                 """
                 resp = bagel_editor.generate_caption(final_prompt)
-                resp = resp.split('\n')
-                description = ""
-                for line in resp:
-                    if line.strip().startswith('Edited Description:'):
-                        description = line.split(':')[1].strip()
-                        break
+                description = _extract_target_image_description(resp)
                 modified_captions.append(description if description else last_captions[i])
                 txt_check_index[i] = True
             else:
@@ -874,20 +934,11 @@ def LLM_modify_editimg_caption(bagel_editor, LLM_model_name, preload_dict, llm_p
             final_prompt = final_prompt + '\n' + 'Instruction: ' + instruction
 
             resp = bagel_editor.generate_caption(final_prompt)
-            resp = resp.split('\n')
-            description = ""
-            aug = False
-            for line in resp:
-                if line.strip().startswith('Edited Description:'):
-                    description = line.split(':')[1].strip()
-                    if description == "":
-                        modified_captions.append(relative_captions[i])
-                    else:
-                        modified_captions.append(description)
-                    aug = True
-                    break
-            if not aug:
+            description = _extract_target_image_description(resp)
+            if description == "":
                 modified_captions.append(relative_captions[i])
+            else:
+                modified_captions.append(description)
         return modified_captions
 
 
