@@ -112,6 +112,13 @@ def parse_arguments():
 
     # === Distributed execution ===
     parser.add_argument("--distributed_generate", action="store_true", help="Shard BAGEL caption/image generation across ranks.")
+    parser.add_argument(
+        "--image_generation_mode",
+        type=str,
+        default="instruction_plus_target",
+        choices=["instruction_only", "target_only", "instruction_plus_target"],
+        help="Stage-1 image query generation mode."
+    )
     parser.add_argument("--bagel_use_multi_gpu", action="store_true", help="Use multi-GPU model-parallel loading for BAGEL in a single process.")
 
     # === Text-to-Image Retrieval Arguments ===
