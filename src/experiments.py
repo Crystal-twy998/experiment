@@ -187,9 +187,14 @@ class Experiment:
         }
 
         file_utils.init_folder(self.dataset_path, self.task)
-        os.makedirs(self.edit_img_dir, exist_ok=True)
+        image_generation_mode = getattr(self, "image_generation_mode", "instruction_only")
+        image_mode_tag = utils._sanitize_tag(image_generation_mode)
+        stage1_edit_img_dir = os.path.join(self.edit_img_dir, image_mode_tag)
+        os.makedirs(stage1_edit_img_dir, exist_ok=True)
         os.makedirs(f"{self.dataset_path}/preload/edited_images", exist_ok=True)
         os.makedirs(f"{self.dataset_path}/preload/img_features", exist_ok=True)
+        print(f"[Stage-1 Image] image_generation_mode = {image_generation_mode}")
+        print(f"[Stage-1 Image] edit_img_dir = {stage1_edit_img_dir}")
 
         if "mods" in self.preload:
             preload_dict["mods"] = f"{self.dataset_path}/task/{self.task}/modified_captions/{self.preload_modified_captions_file}"
@@ -206,7 +211,12 @@ class Experiment:
         if "img_features" in self.preload:
             preload_dict["img_features"] = f"{self.dataset_path}/preload/img_features/{self.clip}_{self.dataset}_{self.split}.pkl"
         if "edited_images" in self.preload:
-            preload_dict["edit_images"] = f"{self.dataset_path}/preload/edited_images/{self.preload_edited_images_file}"
+            edit_meta_file = self.preload_edited_images_file
+            meta_root, meta_ext = os.path.splitext(edit_meta_file)
+            if meta_ext == "":
+                meta_ext = ".pkl"
+            edit_meta_file = f"{meta_root}_{image_mode_tag}{meta_ext}"
+            preload_dict["edit_images"] = f"{self.dataset_path}/preload/edited_images/{edit_meta_file}"
         if "new_captions" in self.preload:
             preload_dict["new_captions"] = f"{self.dataset_path}/task/{self.task}/new_captions/{self.preload_new_captions}"
 
@@ -236,7 +246,7 @@ class Experiment:
                 "max_check_num": self.max_check_num,
                 "Check_LLM_model_name": self.Check_LLM_model_name,
                 "dataset_path": self.dataset_path,
-                "edit_img_dir": self.edit_img_dir,
+                "edit_img_dir": stage1_edit_img_dir,
                 "compute_results_function": compute_results_function,
                 "VQA_LLM_model_name": self.VQA_LLM_model_name,
                 "openai_key": self.openai_key,
