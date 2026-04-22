@@ -355,14 +355,16 @@ class Experiment:
 
             result_metrics, labels = compute_results_fuse2paths_function(**input_kwargs)
             print("\n")
+            is_test_split = str(self.split).lower().startswith("test")
             if result_metrics is not None:
                 termcolor.cprint(f"Final rerank metrics for {self.dataset.upper()} ({self.split}) - {pairing}", attrs=["bold"])
                 for k, v in result_metrics.items():
                     print(f"{pairing}_{k} = {v:.2f}")
-                self._save_metric_artifact("final_rerank", result_metrics)
+                if not is_test_split:
+                    self._save_metric_artifact("final_rerank", result_metrics)
             else:
                 termcolor.cprint(f"No explicit final metrics available for {self.dataset.upper()} ({self.split}) - {pairing}.", attrs=["bold"])
-            if labels is not None:
+            if labels is not None and not is_test_split:
                 self._save_rank_artifact("final_rerank", labels, input_kwargs.get("query_ids", None))
 
         self._release_bagel_editor(bagel_editor)
