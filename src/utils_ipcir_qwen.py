@@ -63,6 +63,96 @@ def _build_ref_img_paths(reference_names: Sequence[str], path_lookup: Dict[str, 
     return [_get_value_by_name(path_lookup, name) for name in reference_names]
 
 
+def _is_number_like(x: Any) -> bool:
+    if isinstance(x, (int, float)):
+        return True
+    if isinstance(x, str):
+        try:
+            float(x)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _extract_vqa_score(item: Any) -> float:
+    if isinstance(item, dict):
+        for key in ("score", "confidence", "prob", "value"):
+            if key in item and _is_number_like(item[key]):
+                return float(item[key])
+        for value in item.values():
+            if _is_number_like(value):
+                return float(value)
+        raise TypeError(f"Cannot extract numeric VQA score from dict: {item!r}")
+
+    if isinstance(item, (list, tuple)):
+        # In this repo VQA candidate records are typically
+        # (rank_index, candidate_path, confidence). Prefer the last field.
+        for value in reversed(item):
+            if _is_number_like(value):
+                return float(value)
+        raise TypeError(f"Cannot extract numeric VQA score from sequence: {item!r}")
+
+    if _is_number_like(item):
+        return float(item)
+
+    raise TypeError(f"Cannot extract numeric VQA score from object: {item!r}")
+
+
+def _build_verifier_score_maps(
+    candidate_names: Sequence[Sequence[str]],
+    raw_scores: Sequence[Any],
+) -> List[Dict[str, float]]:
+    all_maps: List[Dict[str, float]] = []
+    for names, raw in zip(candidate_names, raw_scores):
+        names_list = [str(x) for x in names]
+        if isinstance(raw, dict):
+            score_map = {}
+            for name in names_list:
+                if name in raw:
+                    try:
+                        score_map[name] = float(_extract_vqa_score(raw[name]))
+                    except Exception:
+                        continue
+            all_maps.append(score_map)
+            continue
+
+        if raw is None:
+            all_maps.append({})
+            continue
+
+        values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        usable = min(len(names_list), len(values))
+        score_map = {}
+        for idx in range(usable):
+            try:
+                score_map[names_list[idx]] = float(_extract_vqa_score(values[idx]))
+            except Exception:
+                continue
+        all_maps.append(score_map)
+
+    while len(all_maps) < len(candidate_names):
+        all_maps.append({})
+    return all_maps
+
+
+def _empty_stage2_outputs(num_queries: int) -> Dict[str, Any]:
+    return {
+        "candidates1": [[] for _ in range(num_queries)],
+        "candidates2": [[] for _ in range(num_queries)],
+        "ranks1": [{} for _ in range(num_queries)],
+        "ranks2": [{} for _ in range(num_queries)],
+        "pseudo_targets1": [None for _ in range(num_queries)],
+        "confidences1": [0.0 for _ in range(num_queries)],
+        "pseudo_targets2": [None for _ in range(num_queries)],
+        "confidences2": [0.0 for _ in range(num_queries)],
+        "txt_check_index": [True for _ in range(num_queries)],
+        "img_check_index": [True for _ in range(num_queries)],
+        "rerank_candidates1_names": [[] for _ in range(num_queries)],
+        "rerank_candidates2_names": [[] for _ in range(num_queries)],
+    }
+
+
 def _is_main_process() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
@@ -195,6 +285,7 @@ def generate_editimg_caption_iteration(**kwargs):
     stage1_out["stage1_metric_artifact_path"] = None
     stage1_out["stage1_rank_artifact_path"] = None
 
+    is_test_split = str(kwargs.get("split", "")).lower().startswith("test")
     if _is_main_process():
         if stage1_metrics is not None:
             stage1_out["stage1_metric_artifact_path"] = _save_stage1_metric_artifact(
@@ -204,7 +295,7 @@ def generate_editimg_caption_iteration(**kwargs):
                 dataset=kwargs["dataset_name"],
                 metrics=stage1_metrics,
             )
-        if stage1_labels is not None:
+        if stage1_labels is not None and not is_test_split:
             stage1_out["stage1_rank_artifact_path"] = _save_stage1_rank_artifact(
                 dataset_path=kwargs["dataset_path"],
                 task=kwargs["task"],
@@ -219,6 +310,12 @@ def generate_editimg_caption_iteration(**kwargs):
 
     if requested_stage_mode != "qwen_fusion":
         raise ValueError(f"Unsupported stage_mode in patched wrapper: {requested_stage_mode}")
+
+    distributed_vqa = bool(getattr(args, "distributed_vqa", False))
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and (not distributed_vqa) and (not _is_main_process()):
+        print("[VQA] Distributed run detected with distributed_vqa=False; skip duplicated verifier work on non-main rank.")
+        stage1_out.update(_empty_stage2_outputs(len(stage1_out["reference_names"])))
+        return stage1_out
 
     preload_dict = kwargs["preload_dict"]
     caption_lookup = _read_lookup_csv(preload_dict["captions"], value_key="generated_text")
@@ -290,12 +387,19 @@ def generate_editimg_caption_iteration(**kwargs):
         device=kwargs["device"],
     )
 
+    verifier_score_maps1 = _build_verifier_score_maps(rerank_candidates1_names, candidates1)
+    verifier_score_maps2 = _build_verifier_score_maps(rerank_candidates2_names, candidates2)
+
     stage1_out.update(
         {
-            "candidates1": candidates1,
-            "candidates2": candidates2,
-            "ranks1": ranks1,
-            "ranks2": ranks2,
+            # Use gallery image names as candidate ids so stage-2 reranking actually
+            # matches the stage-1 pool. Raw VQA outputs are kept separately for debugging.
+            "candidates1": rerank_candidates1_names,
+            "candidates2": rerank_candidates2_names,
+            "ranks1": verifier_score_maps1,
+            "ranks2": verifier_score_maps2,
+            "raw_candidates1": candidates1,
+            "raw_candidates2": candidates2,
             "pseudo_targets1": pseudo_targets1,
             "confidences1": confidences1,
             "pseudo_targets2": pseudo_targets2,
