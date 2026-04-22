@@ -103,6 +103,12 @@ def _extract_numeric_score(x: Any) -> float:
     if isinstance(x, np.ndarray):
         x = x.tolist()
     if isinstance(x, (list, tuple)):
+        if len(x) >= 3:
+            # Common verifier tuple: (rank_position, candidate_path, confidence)
+            try:
+                return _extract_numeric_score(x[-1])
+            except Exception:
+                pass
         if len(x) == 2:
             try:
                 return _extract_numeric_score(x[1])
@@ -112,7 +118,7 @@ def _extract_numeric_score(x: Any) -> float:
                 return _extract_numeric_score(x[0])
             except Exception:
                 pass
-        for item in x:
+        for item in reversed(list(x)):
             try:
                 return _extract_numeric_score(item)
             except Exception:
