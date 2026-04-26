@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from argparse import Namespace
 import gc
 import json
 import os
 import pickle
+from argparse import Namespace
 from typing import Any, Dict, List, Sequence
 
 import termcolor
@@ -53,6 +53,7 @@ class Experiment:
 
     def _get_time(self) -> str:
         import datetime
+
         return datetime.datetime.now().strftime("%Y.%m.%d-%H_%M_%S")
 
     def _release_bagel_editor(self, bagel_editor):
@@ -95,20 +96,20 @@ class Experiment:
         print(f"[Artifact] saved metrics to: {save_path}")
         return save_path
 
-    def _ranking_to_dict(self, rankings: Sequence[Sequence[str]], query_ids: Sequence[Any] | None) -> Dict[str, List[str]]:
-        if query_ids is None:
-            query_ids = list(range(len(rankings)))
-        out: Dict[str, List[str]] = {}
-        for qid, rank in zip(query_ids, rankings):
-            out[str(qid)] = [str(x) for x in rank]
-        return out
-
-    def _save_rank_artifact(self, tag: str, rankings: Sequence[Sequence[str]], query_ids: Sequence[Any] | None) -> str:
+    def _save_rank_artifact(self, tag: str, rankings: Sequence[Sequence[str]], input_kwargs: Dict[str, Any] | None = None) -> str:
+        input_kwargs = input_kwargs or {}
         save_path = os.path.join(
             self._task_dir(),
             f"top_rank_{self.clip}_{self.dataset}_{tag}_{self._get_time()}.json",
         )
-        self._write_json(save_path, self._ranking_to_dict(rankings, query_ids))
+        records = compute_results_ipcir_qwen.build_top_rank_records(
+            rankings=rankings,
+            query_ids=input_kwargs.get("query_ids", None),
+            reference_names=input_kwargs.get("reference_names", None),
+            target_names=input_kwargs.get("target_names", None),
+            topk=50,
+        )
+        self._write_json(save_path, records)
         print(f"[Artifact] saved rankings to: {save_path}")
         return save_path
 
@@ -266,7 +267,6 @@ class Experiment:
 
         for query_dataset, target_dataset, pairing in zip(query_datasets, target_datasets, pairings):
             termcolor.cprint(f"\n------ Evaluating Retrieval Setup: {pairing}", color="yellow", attrs=["bold"])
-
             input_kwargs = {
                 "args": self.args,
                 "bagel_editor": bagel_editor,
@@ -333,7 +333,6 @@ class Experiment:
                         print(f"{pairing}_merged_{k} = {v:.2f}")
                 else:
                     print(f"[Stage1 merged] No explicit metrics for split={self.split}.")
-
                 if input_kwargs.get("stage1_metric_artifact_path"):
                     print(f"[Stage1 merged] metric file: {input_kwargs['stage1_metric_artifact_path']}")
                 if input_kwargs.get("stage1_rank_artifact_path"):
@@ -348,14 +347,14 @@ class Experiment:
 
             if self.distributed and dist.is_initialized():
                 dist.barrier()
-
-            if not self.is_main_process():
-                print(f"[Distributed] rank={self.rank} finished VQA shard for {pairing}.")
-                continue
+                if not self.is_main_process():
+                    print(f"[Distributed] rank={self.rank} finished VQA shard for {pairing}.")
+                    continue
 
             result_metrics, labels = compute_results_fuse2paths_function(**input_kwargs)
             print("\n")
             is_test_split = str(self.split).lower().startswith("test")
+
             if result_metrics is not None:
                 termcolor.cprint(f"Final rerank metrics for {self.dataset.upper()} ({self.split}) - {pairing}", attrs=["bold"])
                 for k, v in result_metrics.items():
@@ -364,7 +363,10 @@ class Experiment:
                     self._save_metric_artifact("final_rerank", result_metrics)
             else:
                 termcolor.cprint(f"No explicit final metrics available for {self.dataset.upper()} ({self.split}) - {pairing}.", attrs=["bold"])
-            if labels is not None and not is_test_split:
-                self._save_rank_artifact("final_rerank", labels, input_kwargs.get("query_ids", None))
+
+            # Important fix: save final top-rank records for both val and test.
+            # The saved record always contains top-50 names even if the rerank pool is 100+.
+            if labels is not None:
+                self._save_rank_artifact("final_rerank", labels, input_kwargs)
 
         self._release_bagel_editor(bagel_editor)
