@@ -183,7 +183,35 @@ def _latest_json_matches(out_dir: str, prefixes: Sequence[str]) -> Optional[Dict
 
 
 def _raw_cirr_uses_metadata(kwargs: Dict[str, Any], subset: bool) -> bool:
-    """Match the t2i/i2i CIRR submission style already produced by base_utils."""
+    """Return whether CIRR test submissions should include version/metric.
+
+    Merged/final must match raw t2i/i2i style, but old merged/final files in
+    the task directory must never pollute this choice.
+
+    Optional config:
+        "cirr_submission_with_metadata": true / false / "auto"
+
+    In auto mode, only the latest raw t2i/i2i file is inspected. If no raw file
+    exists yet, default to True because the original CIRR/WISER submission writer
+    uses {"version": "rc2", "metric": ...} metadata.
+    """
+    args = kwargs.get("args", None)
+    setting = kwargs.get("cirr_submission_with_metadata", None)
+    if setting is None and args is not None:
+        setting = getattr(args, "cirr_submission_with_metadata", "auto")
+    if setting is None:
+        setting = "auto"
+
+    if isinstance(setting, bool):
+        return setting
+
+    setting_str = str(setting).strip().lower()
+    if setting_str in {"1", "true", "yes", "y", "metadata", "with_metadata", "rc2", "original"}:
+        return True
+    if setting_str in {"0", "false", "no", "n", "pure", "dict", "without_metadata", "none"}:
+        return False
+
+    # Auto: inspect raw t2i/i2i only. Never inspect merged/final files.
     out_dir = _task_output_dir(kwargs)
     clip_prefix = _clip_prefix_from_kwargs(kwargs)
     dataset = str(kwargs.get("dataset_name", "cirr")).lower()
@@ -191,19 +219,16 @@ def _raw_cirr_uses_metadata(kwargs: Dict[str, Any], subset: bool) -> bool:
         prefixes = [
             f"subset_test_submissions_{clip_prefix}{dataset}_t2i_cirr_loop_",
             f"subset_test_submissions_{clip_prefix}{dataset}_i2i_cirr_loop_",
-            f"subset_test_submissions_{clip_prefix}{dataset}_final_rerank_cirr_loop_",
         ]
     else:
         prefixes = [
             f"test_submissions_{clip_prefix}{dataset}_t2i_cirr_loop_",
             f"test_submissions_{clip_prefix}{dataset}_i2i_cirr_loop_",
-            f"test_submissions_{clip_prefix}{dataset}_final_rerank_cirr_loop_",
         ]
     payload = _latest_json_matches(out_dir, prefixes)
     if payload is None:
-        return False
+        return True
     return "version" in payload or "metric" in payload
-
 
 def _wrap_cirr_submission(kwargs: Dict[str, Any], body: Dict[str, List[str]], subset: bool) -> Dict[str, Any]:
     if not _raw_cirr_uses_metadata(kwargs, subset=subset):
@@ -264,39 +289,61 @@ def _save_cirr_test_submissions(
     ways: str,
     fallback_rank_keys: Sequence[str] = (),
 ) -> Tuple[str, str]:
-    """Save CIRR test/subset submissions using the same convention as raw t2i/i2i.
+    """Save CIRR test/subset submissions with the same semantics as raw t2i/i2i.
 
-    This function only writes the requested branch (`merged` or `final_rerank`).
-    It does not re-save raw t2i/i2i submissions. The subset ranking is derived
-    strictly from this branch ranking: remove the reference image, then keep the
-    first images that belong to the CIRR group, matching the original submission
-    semantics.
+    This function writes only the requested branch (`merged` or `final_rerank`).
+    It never re-saves raw t2i/i2i submissions.
+
+    Semantics are exactly CIRR-style:
+        1. start from this branch ranking;
+        2. remove the reference image;
+        3. full submission = top-50;
+        4. subset submission = first 3 names in the same ranking that are in the
+           CIRR group.
+
+    No fallback补齐 is used here. If subset is short, the caller passed a short
+    ranking. For `merged`, pass full stage1_pool_names. For `final_rerank`, pass
+    reranked_topK + merged_tail.
     """
+    if not bool(kwargs.get("save_outputs", True)):
+        return "", ""
+
     out_dir = _task_output_dir(kwargs)
     ts = get_time()
     clip_prefix = _clip_prefix_from_kwargs(kwargs)
     dataset = str(kwargs.get("dataset_name", "cirr")).lower()
     loop = kwargs.get("loop", 0)
+
     query_ids = _listify(kwargs.get("query_ids", list(range(len(rankings)))))
     targets = kwargs.get("targets", [[] for _ in rankings])
     reference_names = _listify(kwargs.get("reference_names", [None for _ in rankings]))
 
     full_body: Dict[str, List[str]] = {}
     subset_body: Dict[str, List[str]] = {}
+
     for idx, (qid, rank, group) in enumerate(zip(query_ids, rankings, targets)):
         key = _submission_query_key(qid)
         ref = reference_names[idx] if idx < len(reference_names) else None
-        filtered_rank = [n for n in _unique_keep_order(_listify(rank)) if ref is None or n != _to_str(ref)]
-        full_body[key] = filtered_rank[:50]
-
+        ref_str = None if ref is None else _to_str(ref)
+        filtered_rank = [
+            name for name in _unique_keep_order(_listify(rank))
+            if ref_str is None or name != ref_str
+        ]
         group_set = {_to_str(x) for x in _listify(group)}
+        full_body[key] = filtered_rank[:50]
         subset_body[key] = [name for name in filtered_rank if name in group_set][:3]
 
     submission = _wrap_cirr_submission(kwargs, full_body, subset=False)
     group_submission = _wrap_cirr_submission(kwargs, subset_body, subset=True)
 
-    save_path = os.path.join(out_dir, f"test_submissions_{clip_prefix}{dataset}_{ways}_cirr_loop_{loop}_{ts}.json")
-    subset_save_path = os.path.join(out_dir, f"subset_test_submissions_{clip_prefix}{dataset}_{ways}_cirr_loop_{loop}_{ts}.json")
+    save_path = os.path.join(
+        out_dir,
+        f"test_submissions_{clip_prefix}{dataset}_{ways}_cirr_loop_{loop}_{ts}.json",
+    )
+    subset_save_path = os.path.join(
+        out_dir,
+        f"subset_test_submissions_{clip_prefix}{dataset}_{ways}_cirr_loop_{loop}_{ts}.json",
+    )
     _save_json(save_path, submission)
     _save_json(subset_save_path, group_submission)
     print(f"Saved CIRR {ways} test submission to {save_path}")
@@ -695,26 +742,40 @@ def cirr_fuse2paths(**kwargs: Any) -> Tuple[Optional[Dict[str, float]], List[Lis
         confidences1=kwargs.get("confidences1", []),
         confidences2=kwargs.get("confidences2", []),
     )
+
     reference_names = _listify(kwargs.get("reference_names", []))
-    filtered_rankings = []
-    for ref_name, pred in zip(reference_names, final_rankings):
-        filtered_rankings.append([n for n in _listify(pred) if n != ref_name])
+    is_test = str(split).lower().startswith("test")
 
-    query_ids = _listify(kwargs.get("query_ids", list(range(len(filtered_rankings)))))
-    group_members = kwargs.get("targets", [[] for _ in filtered_rankings])
+    # For CIRR test submission, the official subset file must be generated from
+    # a sufficiently complete ranking. Qwen still reranks only topK, but the
+    # saved final ranking is reranked_topK + merged_full_tail. This does not
+    # change VQA cost and keeps final top-50 controlled by reranking.
+    rankings_for_eval_or_save: List[List[str]] = []
+    if is_test:
+        merged_full = kwargs.get("stage1_pool_names", [])
+        for i, rank in enumerate(final_rankings):
+            merged_tail = _get_rank_at(merged_full, i)
+            rankings_for_eval_or_save.append(_unique_keep_order(_listify(rank) + merged_tail))
+    else:
+        # Keep validation behavior unchanged, because previous CIRR val metrics
+        # were already correct and should not be affected by test-submission
+        # completion logic.
+        rankings_for_eval_or_save = [_unique_keep_order(_listify(x)) for x in final_rankings]
 
-    if str(split).lower().startswith("test"):
+    filtered_rankings: List[List[str]] = []
+    for idx, pred in enumerate(rankings_for_eval_or_save):
+        ref_name = reference_names[idx] if idx < len(reference_names) else None
+        ref_str = None if ref_name is None else _to_str(ref_name)
+        filtered_rankings.append([n for n in _listify(pred) if ref_str is None or n != ref_str])
+
+    if is_test:
         if not _is_main_process():
             return None, filtered_rankings
-        _save_cirr_test_submissions(
-            kwargs,
-            filtered_rankings,
-            ways="final_rerank",
-            fallback_rank_keys=("stage1_pool_names", "txt_sorted_index_names", "img_sorted_index_names"),
-        )
+        _save_cirr_test_submissions(kwargs, filtered_rankings, ways="final_rerank")
         return None, filtered_rankings
 
     target_names = _listify(kwargs.get("target_names", []))
+    group_members = kwargs.get("targets", [[] for _ in filtered_rankings])
     metrics: Dict[str, float] = {}
     for k in [1, 5, 10, 50]:
         hits = [1.0 if tgt in rank[:k] else 0.0 for tgt, rank in zip(target_names, filtered_rankings)]
@@ -727,7 +788,6 @@ def cirr_fuse2paths(**kwargs: Any) -> Tuple[Optional[Dict[str, float]], List[Lis
             group_hits.append(1.0 if tgt in pred else 0.0)
         metrics[f"group_recall@{k}"] = float(np.mean(group_hits) * 100.0) if group_hits else 0.0
     return metrics, filtered_rankings
-
 
 def circo_fuse2paths(**kwargs: Any) -> Tuple[Optional[Dict[str, float]], List[List[str]]]:
     args = kwargs["args"]
