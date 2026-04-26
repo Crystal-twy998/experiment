@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import os
-from typing import Any, Dict, List, Sequence, Tuple
-
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
 import torch
+import torch.distributed as dist
 
-import utils as base_utils
 import compute_results_ipcir_qwen
+import utils as base_utils
 from stage1_pooling import build_ipcir_stage1_pool
 
 
-def _to_str(x) -> str:
+def _to_str(x: Any) -> str:
     if isinstance(x, bytes):
         return x.decode("utf-8")
     return str(x)
@@ -29,6 +31,28 @@ def _default_lambda(dataset_name: str) -> float:
     return 0.3
 
 
+def _is_main_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _dist_is_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _get_time() -> str:
+    return datetime.datetime.now().strftime("%Y.%m.%d-%H_%M_%S")
+
+
+def _write_json(path: str, data: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _task_dir(dataset_path: str, task: str) -> str:
+    return os.path.join(dataset_path, "task", task)
+
+
 def _read_lookup_csv(csv_path: str, value_key: str) -> Dict[str, str]:
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -36,7 +60,7 @@ def _read_lookup_csv(csv_path: str, value_key: str) -> Dict[str, str]:
         for row in reader:
             image_id = str(row["image_id"]).lstrip("0")
             out[image_id] = row[value_key]
-    return out
+        return out
 
 
 def _get_value_by_name(lookup: Dict[str, str], name: str) -> str:
@@ -86,8 +110,8 @@ def _extract_vqa_score(item: Any) -> float:
         raise TypeError(f"Cannot extract numeric VQA score from dict: {item!r}")
 
     if isinstance(item, (list, tuple)):
-        # In this repo VQA candidate records are typically
-        # (rank_index, candidate_path, confidence). Prefer the last field.
+        # Raw verifier records are often (rank_index, candidate_path, confidence).
+        # Prefer the last numeric field.
         for value in reversed(item):
             if _is_number_like(value):
                 return float(value)
@@ -95,7 +119,6 @@ def _extract_vqa_score(item: Any) -> float:
 
     if _is_number_like(item):
         return float(item)
-
     raise TypeError(f"Cannot extract numeric VQA score from object: {item!r}")
 
 
@@ -107,7 +130,7 @@ def _build_verifier_score_maps(
     for names, raw in zip(candidate_names, raw_scores):
         names_list = [str(x) for x in names]
         if isinstance(raw, dict):
-            score_map = {}
+            score_map: Dict[str, float] = {}
             for name in names_list:
                 if name in raw:
                     try:
@@ -116,21 +139,18 @@ def _build_verifier_score_maps(
                         continue
             all_maps.append(score_map)
             continue
-
         if raw is None:
             all_maps.append({})
             continue
-
         values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
         usable = min(len(names_list), len(values))
-        score_map = {}
+        score_map: Dict[str, float] = {}
         for idx in range(usable):
             try:
                 score_map[names_list[idx]] = float(_extract_vqa_score(values[idx]))
             except Exception:
                 continue
         all_maps.append(score_map)
-
     while len(all_maps) < len(candidate_names):
         all_maps.append({})
     return all_maps
@@ -153,58 +173,41 @@ def _empty_stage2_outputs(num_queries: int) -> Dict[str, Any]:
     }
 
 
-def _is_main_process() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-
-def _get_time() -> str:
-    import datetime
-    return datetime.datetime.now().strftime("%Y.%m.%d-%H_%M_%S")
-
-
-def _write_json(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def _ranking_to_dict(rankings: Sequence[Sequence[str]], query_ids: Sequence[Any] | None) -> Dict[str, List[str]]:
-    if query_ids is None:
-        query_ids = list(range(len(rankings)))
-    out: Dict[str, List[str]] = {}
-    for qid, rank in zip(query_ids, rankings):
-        out[str(qid)] = [str(x) for x in rank]
+def _dedup_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for r in records:
+        key = r.get("query_id") or r.get("image_index") or len(out)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
     return out
 
 
-def _task_dir(dataset_path: str, task: str) -> str:
-    return os.path.join(dataset_path, "task", task)
+def _gather_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not _dist_is_ready():
+        return records
+    gathered: List[Optional[List[Dict[str, Any]]]] = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, records)
+    merged: List[Dict[str, Any]] = []
+    for part in gathered:
+        if part:
+            merged.extend(part)
+    return _dedup_records(merged)
 
 
-def _save_stage1_metric_artifact(dataset_path: str, task: str, clip: str, dataset: str, metrics: Dict[str, float]) -> str:
-    save_path = os.path.join(
-        _task_dir(dataset_path, task),
-        f"result_{clip}_{dataset}_merged_loop_0_{_get_time()}.json",
-    )
+def _save_metric_artifact(dataset_path: str, task: str, clip: str, dataset: str, tag: str, metrics: Dict[str, float]) -> str:
+    save_path = os.path.join(_task_dir(dataset_path, task), f"result_{clip}_{dataset}_{tag}_{_get_time()}.json")
     _write_json(save_path, metrics)
-    print(f"[Artifact] saved stage1 merged metrics to: {save_path}")
+    print(f"[Artifact] saved metrics to: {save_path}")
     return save_path
 
 
-def _save_stage1_rank_artifact(
-    dataset_path: str,
-    task: str,
-    clip: str,
-    dataset: str,
-    rankings: Sequence[Sequence[str]],
-    query_ids: Sequence[Any] | None,
-) -> str:
-    save_path = os.path.join(
-        _task_dir(dataset_path, task),
-        f"top_rank_{clip}_{dataset}_merged_loop_0_{_get_time()}.json",
-    )
-    _write_json(save_path, _ranking_to_dict(rankings, query_ids))
-    print(f"[Artifact] saved stage1 merged rankings to: {save_path}")
+def _save_record_artifact(dataset_path: str, task: str, clip: str, dataset: str, tag: str, records: Sequence[Dict[str, Any]]) -> str:
+    save_path = os.path.join(_task_dir(dataset_path, task), f"top_rank_{clip}_{dataset}_{tag}_{_get_time()}.json")
+    _write_json(save_path, list(records))
+    print(f"[Artifact] saved top-rank records to: {save_path}")
     return save_path
 
 
@@ -221,27 +224,153 @@ def _compute_stage1_metrics_and_labels(dataset_name: str, stage1_out: Dict[str, 
     return None, None
 
 
+def _build_stage_records(stage1_out: Dict[str, Any], rankings: Sequence[Sequence[str]], topk: int = 50) -> List[Dict[str, Any]]:
+    return compute_results_ipcir_qwen.build_top_rank_records(
+        rankings=rankings,
+        query_ids=stage1_out.get("query_ids"),
+        reference_names=stage1_out.get("reference_names"),
+        target_names=stage1_out.get("target_names"),
+        topk=topk,
+    )
+
+
+def _safe_get_stage_sequence(stage1_out: Dict[str, Any], key: str) -> List[List[str]]:
+    values = stage1_out.get(key)
+    if values is None:
+        return []
+    out: List[List[str]] = []
+    for item in values:
+        if isinstance(item, torch.Tensor):
+            item = item.detach().cpu().tolist()
+        if hasattr(item, "tolist") and not isinstance(item, (list, tuple)):
+            item = item.tolist()
+        if isinstance(item, (list, tuple)):
+            out.append([_to_str(x) for x in item])
+        else:
+            out.append([_to_str(item)])
+    return out
+
+
+def _unique_keep_order(names: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for name in names:
+        s = _to_str(name)
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().tolist()
+    elif hasattr(x, "tolist") and not isinstance(x, (list, tuple, set, str, bytes)):
+        try:
+            x = x.tolist()
+        except Exception:
+            pass
+    if isinstance(x, (list, tuple, set)):
+        return list(x)
+    return [x]
+
+
+def _build_submission_dict(rankings: Sequence[Sequence[Any]], query_ids: Sequence[Any], topk: int = 50) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for qid, rank in zip(query_ids, rankings):
+        out[_to_str(qid)] = _unique_keep_order(rank)[: int(topk)]
+    return out
+
+
+def _filter_cirr_reference(rankings: Sequence[Sequence[str]], reference_names: Sequence[Any]) -> List[List[str]]:
+    if not reference_names or len(reference_names) != len(rankings):
+        return [[_to_str(x) for x in rank] for rank in rankings]
+    filtered: List[List[str]] = []
+    for ref_name, rank in zip(reference_names, rankings):
+        ref = _to_str(ref_name)
+        filtered.append([_to_str(x) for x in rank if _to_str(x) != ref])
+    return filtered
+
+
+def _save_raw_branch_top_rank_artifacts(kwargs: Dict[str, Any], stage1_out: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Save inspectable top-50 records for raw t2i/i2i rankings on every split."""
+    if not _is_main_process():
+        return {}
+
+    saved: Dict[str, Optional[str]] = {"t2i_rank_artifact_path": None, "i2i_rank_artifact_path": None}
+    reference_names = stage1_out.get("reference_names")
+    target_names = stage1_out.get("target_names")
+    query_ids = stage1_out.get("query_ids")
+
+    for branch, key in (("t2i", "txt_sorted_index_names"), ("i2i", "img_sorted_index_names")):
+        rankings = _safe_get_stage_sequence(stage1_out, key)
+        if not rankings:
+            print(f"[Artifact] skip raw {branch} top-rank artifact because {key} is missing.")
+            continue
+        records = compute_results_ipcir_qwen.build_top_rank_records(
+            rankings=rankings,
+            query_ids=query_ids,
+            reference_names=reference_names,
+            target_names=target_names,
+            topk=50,
+        )
+        path = _save_record_artifact(
+            dataset_path=kwargs["dataset_path"],
+            task=kwargs["task"],
+            clip=kwargs["clip"],
+            dataset=kwargs["dataset_name"],
+            tag=f"{branch}_loop_0",
+            records=records,
+        )
+        saved[f"{branch}_rank_artifact_path"] = path
+
+    return saved
+
+
+def _clip_prefix_for_submission(clip: Any) -> str:
+    clip = "" if clip is None else str(clip).strip()
+    return f"{clip}_" if clip else ""
+
+
+def _query_id_to_key(qid: Any) -> str:
+    """Match the original compute_results.py behavior for official submissions."""
+    if isinstance(qid, torch.Tensor):
+        qid = qid.detach().cpu().item()
+    try:
+        return str(int(qid))
+    except Exception:
+        return _to_str(qid)
+
+
 def generate_editimg_caption_iteration(**kwargs):
-    """
-    1) Reuse the original code to generate:
-       - text branch (target captions)
-       - proxy-image branch (edited image)
-       - original t2i / i2i metrics and json artifacts
-    2) Build a strict IP-CIR merged stage-1 pool:
-       - f_s = f_t - f_o
-       - f_RP = f_p + scaled(f_q) + scaled(f_s)
-       - S_f = lambda * S_t + (1 - lambda) * (S_t * S_p)
-    3) Save merged stage-1 artifacts immediately, before VQA.
-       This guarantees that initial_only and qwen_fusion both get the same
-       stage1 merged files, and that stage2 failures do not affect stage1 files.
-    4) Take the merged pool topK for verifier reranking when stage_mode=qwen_fusion.
+    """IP-CIR wrapper.
+
+    Fixed behavior:
+    1. Run fast t2i/i2i stage through the original utility.
+    2. Build the IP-CIR merged pool for every split/dataset.
+    3. Save merged submissions for CIRR/CIRCO test.
+    4. Save merged top-rank records for train/val/test, always with top-50 names.
+    5. Use merged top-100 candidates for Qwen verifier by default.
     """
     args = kwargs["args"]
     requested_stage_mode = getattr(args, "stage_mode", "initial_only")
 
+    # Force original pipeline to stop after fast t2i/i2i, then restore the requested mode.
     setattr(args, "stage_mode", "initial_only")
     stage1_out = base_utils.generate_editimg_caption_iteration(**kwargs)
     setattr(args, "stage_mode", requested_stage_mode)
+
+    # Save inspectable top-50 records for raw t2i/i2i.
+    # Do NOT rewrite official raw t2i/i2i submission files here: base_utils already
+    # saves them, and rewriting them can introduce inconsistent subset formatting.
+    # Do not re-save raw t2i/i2i submissions here. The original base_utils
+    # already writes them in the official format. Re-saving in this wrapper
+    # can duplicate/overwrite files and make t2i/i2i subset outputs identical.
+    raw_rank_paths = _save_raw_branch_top_rank_artifacts(kwargs, stage1_out)
+    stage1_out.update(raw_rank_paths)
 
     query_caption_features = base_utils.text_encoding(
         device=kwargs["device"],
@@ -252,8 +381,11 @@ def generate_editimg_caption_iteration(**kwargs):
     )
     query_caption_features = torch.nn.functional.normalize(query_caption_features.float(), dim=-1)
 
-    rerank_pool_size = int(getattr(args, "rerank_pool_size", getattr(args, "topk_for_vqa", 50)))
+    # User-requested default: rerank merged top-100 candidates.
+    rerank_pool_size = int(getattr(args, "rerank_pool_size", getattr(args, "topk_for_vqa", 100)))
+    rerank_pool_size = max(rerank_pool_size, 100)
     prior_topk = int(getattr(args, "ipcir_prior_topk", max(rerank_pool_size, 100)))
+    prior_topk = max(prior_topk, rerank_pool_size, 100)
     lambda_weight = float(getattr(args, "ipcir_lambda", _default_lambda(kwargs["dataset_name"])))
 
     pool_result = build_ipcir_stage1_pool(
@@ -278,41 +410,49 @@ def generate_editimg_caption_iteration(**kwargs):
         }
     )
 
-    # Save stage1 merged artifacts right here, before any VQA reranking.
+    # Compute merged metrics and labels. For CIRR/CIRCO test, this also writes merged submission files.
     stage1_metrics, stage1_labels = _compute_stage1_metrics_and_labels(kwargs["dataset_name"], stage1_out, kwargs)
+    if stage1_labels is None:
+        stage1_labels = stage1_out["stage1_pool_names"]
+
+    # Merged official test submissions are saved inside compute_results_ipcir_qwen.*_stage1_pool
+    # using the same filename/location/style as raw t2i/i2i and final-rerank submissions.
     stage1_out["stage1_output_metrics"] = stage1_metrics
     stage1_out["stage1_output_labels"] = stage1_labels
     stage1_out["stage1_metric_artifact_path"] = None
     stage1_out["stage1_rank_artifact_path"] = None
 
-    is_test_split = str(kwargs.get("split", "")).lower().startswith("test")
+    # Save top-rank debug records for every split, including test. Always save top-50.
+    local_records = _build_stage_records(stage1_out, stage1_labels, topk=50)
+    gathered_records = _gather_records(local_records)
+
     if _is_main_process():
         if stage1_metrics is not None:
-            stage1_out["stage1_metric_artifact_path"] = _save_stage1_metric_artifact(
+            stage1_out["stage1_metric_artifact_path"] = _save_metric_artifact(
                 dataset_path=kwargs["dataset_path"],
                 task=kwargs["task"],
                 clip=kwargs["clip"],
                 dataset=kwargs["dataset_name"],
+                tag="merged_loop_0",
                 metrics=stage1_metrics,
             )
-        if stage1_labels is not None and not is_test_split:
-            stage1_out["stage1_rank_artifact_path"] = _save_stage1_rank_artifact(
-                dataset_path=kwargs["dataset_path"],
-                task=kwargs["task"],
-                clip=kwargs["clip"],
-                dataset=kwargs["dataset_name"],
-                rankings=stage1_labels,
-                query_ids=stage1_out.get("query_ids"),
-            )
+        stage1_out["stage1_rank_artifact_path"] = _save_record_artifact(
+            dataset_path=kwargs["dataset_path"],
+            task=kwargs["task"],
+            clip=kwargs["clip"],
+            dataset=kwargs["dataset_name"],
+            tag="merged_loop_0",
+            records=gathered_records,
+        )
 
     if requested_stage_mode == "initial_only":
         return stage1_out
 
     if requested_stage_mode != "qwen_fusion":
-        raise ValueError(f"Unsupported stage_mode in patched wrapper: {requested_stage_mode}")
+        raise ValueError(f"Unsupported stage_mode in IP-CIR wrapper: {requested_stage_mode}")
 
     distributed_vqa = bool(getattr(args, "distributed_vqa", False))
-    if torch.distributed.is_available() and torch.distributed.is_initialized() and (not distributed_vqa) and (not _is_main_process()):
+    if _dist_is_ready() and (not distributed_vqa) and (not _is_main_process()):
         print("[VQA] Distributed run detected with distributed_vqa=False; skip duplicated verifier work on non-main rank.")
         stage1_out.update(_empty_stage2_outputs(len(stage1_out["reference_names"])))
         return stage1_out
@@ -329,20 +469,14 @@ def generate_editimg_caption_iteration(**kwargs):
         rerank_candidates2_names = [list(x) for x in merged_top_names]
     elif verifier_mode == "merged_plus_i2i":
         rerank_candidates1_names = merged_top_names
-        rerank_candidates2_names = [
-            list(x[:rerank_pool_size]) if hasattr(x, "tolist") else list(x[:rerank_pool_size])
-            for x in stage1_out["img_sorted_index_names"]
-        ]
+        rerank_candidates2_names = [list(x[:rerank_pool_size]) for x in stage1_out["img_sorted_index_names"]]
     else:
+        # Default: only score the IP-CIR merged candidates once.
         rerank_candidates1_names = merged_top_names
         rerank_candidates2_names = [[] for _ in merged_top_names]
 
-    txt_top_captions, txt_top_img_paths = _build_candidate_side_info(
-        rerank_candidates1_names, caption_lookup, path_lookup
-    )
-    img_top_captions, img_top_img_paths = _build_candidate_side_info(
-        rerank_candidates2_names, caption_lookup, path_lookup
-    )
+    txt_top_captions, txt_top_img_paths = _build_candidate_side_info(rerank_candidates1_names, caption_lookup, path_lookup)
+    img_top_captions, img_top_img_paths = _build_candidate_side_info(rerank_candidates2_names, caption_lookup, path_lookup)
 
     txt_check_index = [True for _ in range(len(stage1_out["reference_names"]))]
     img_check_index = [True for _ in range(len(stage1_out["reference_names"]))]
@@ -392,8 +526,7 @@ def generate_editimg_caption_iteration(**kwargs):
 
     stage1_out.update(
         {
-            # Use gallery image names as candidate ids so stage-2 reranking actually
-            # matches the stage-1 pool. Raw VQA outputs are kept separately for debugging.
+            # Use gallery image names as candidate ids so stage-2 reranking matches stage-1 pool.
             "candidates1": rerank_candidates1_names,
             "candidates2": rerank_candidates2_names,
             "ranks1": verifier_score_maps1,
