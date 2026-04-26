@@ -5,7 +5,7 @@ import datetime
 import json
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
- 
+
 import torch
 import torch.distributed as dist
 
@@ -186,16 +186,14 @@ def _dedup_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _gather_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not _dist_is_ready():
-        return records
-    gathered: List[Optional[List[Dict[str, Any]]]] = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(gathered, records)
-    merged: List[Dict[str, Any]] = []
-    for part in gathered:
-        if part:
-            merged.extend(part)
-    return _dedup_records(merged)
+    """Artifact-only helper.
 
+    Do not call dist.all_gather_object here. These records are only for
+    human-checkable debug JSON files. After long VQA reranking, different ranks
+    may enter/skip artifact saving at different times, and a collective here can
+    trigger NCCL ALLGATHER watchdog timeout. Rank0 writes its local artifacts.
+    """
+    return _dedup_records(records)
 
 def _save_metric_artifact(dataset_path: str, task: str, clip: str, dataset: str, tag: str, metrics: Dict[str, float]) -> str:
     save_path = os.path.join(_task_dir(dataset_path, task), f"result_{clip}_{dataset}_{tag}_{_get_time()}.json")
