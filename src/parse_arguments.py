@@ -12,22 +12,30 @@ def parse_arguments():
     parser.add_argument("--device", type=int, default=0, help="GPU ID to use.")
     parser.add_argument(
         "--preload",
-        nargs='+',
+        nargs="+",
         type=str,
-        default=['captions', 'mods'],
-        help="List of properties to preload (computed once before)."
+        default=["captions", "mods"],
+        help="List of properties to preload (computed once before).",
     )
 
     # === Base Model Choices ===
     parser.add_argument(
         "--clip",
         type=str,
-        default='ViT-B-32',
+        default="ViT-B-32",
         choices=[
-            'ViT-Base/32', 'ViT-B/32', 'ViT-B/16', 'ViT-L/14',
-            'ViT-bigG-14', 'ViT-B-32', 'ViT-B-16', 'ViT-L-14', 'ViT-H-14', 'ViT-g-14'
+            "ViT-Base/32",
+            "ViT-B/32",
+            "ViT-B/16",
+            "ViT-L/14",
+            "ViT-bigG-14",
+            "ViT-B-32",
+            "ViT-B-16",
+            "ViT-L-14",
+            "ViT-H-14",
+            "ViT-g-14",
         ],
-        help="Which CLIP text-to-image retrieval model to use."
+        help="Which CLIP text-to-image retrieval model to use.",
     )
 
     # === Dataset Arguments ===
@@ -37,29 +45,35 @@ def parse_arguments():
         type=str,
         required=False,
         choices=[
-            'cirr', 'circo', 'fashioniq_dress', 'fashioniq_toptee', 'fashioniq_shirt',
-            'genecis_change_attribute', 'genecis_change_object', 'genecis_focus_attribute',
-            'genecis_focus_object'
+            "cirr",
+            "circo",
+            "fashioniq_dress",
+            "fashioniq_toptee",
+            "fashioniq_shirt",
+            "genecis_change_attribute",
+            "genecis_change_object",
+            "genecis_focus_attribute",
+            "genecis_focus_object",
         ],
-        help="Dataset to use"
+        help="Dataset to use",
     )
-    parser.add_argument("--split", type=str, default='val', choices=['val', 'test'], help='Dataset split to evaluate on.')
+    parser.add_argument("--split", type=str, default="val", choices=["val", "test"], help="Dataset split to evaluate on.")
     parser.add_argument("--dataset_path", default="../datasets/FASHIONIQ", type=str, required=False, help="Path to the dataset")
-    parser.add_argument("--preprocess-type", default="targetpad", type=str, choices=['clip', 'targetpad'], help="Preprocess pipeline to use")
+    parser.add_argument("--preprocess-type", default="targetpad", type=str, choices=["clip", "targetpad"], help="Preprocess pipeline to use")
 
     # === LLM & BLIP Prompt Arguments ===
-    available_prompts = [f'prompts.{x}' for x in prompts.__dict__.keys() if '__' not in x]
+    available_prompts = [f"prompts.{x}" for x in prompts.__dict__.keys() if "__" not in x]
     parser.add_argument(
         "--llm_prompt",
-        default='prompts.structural_modifier_prompt_fashion',
+        default="prompts.structural_modifier_prompt_fashion",
         type=str,
         choices=available_prompts,
-        help='Base prompt to use to probe the LLM. Must be available in prompts.py'
+        help="Base prompt to use to probe the LLM. Must be available in prompts.py",
     )
-    parser.add_argument("--openai_key", default="<your_openai_key_here>", type=str, help='Account key for OpenAI LLM usage.')
+    parser.add_argument("--openai_key", default="", type=str, help="Account key for OpenAI LLM usage.")
 
     # === Caption Checking Arguments ===
-    parser.add_argument("--max_check_num", default=1, type=int, help='Maximum number of times the modified captions need to be checked.')
+    parser.add_argument("--max_check_num", default=1, type=int, help="Maximum number of times the modified captions need to be checked.")
 
     # === LLM Model Arguments ===
     parser.add_argument(
@@ -67,14 +81,14 @@ def parse_arguments():
         default="gpt-4o-mini",
         type=str,
         choices=["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "qwen-turbo", "bagel"],
-        help='LLM model name to use.'
+        help="LLM model name to use.",
     )
     parser.add_argument(
         "--Check_LLM_model_name",
         default="gpt_4o_mini",
         type=str,
         choices=["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "qwen-turbo", "qwen2_5_vl_7b_instruct"],
-        help='LLM model name to check modified captions.'
+        help="LLM model name to check modified captions.",
     )
     parser.add_argument(
         "--VQA_LLM_model_name",
@@ -92,7 +106,7 @@ def parse_arguments():
             "gpt-4o-mini",
             "gpt-3.5-turbo",
         ],
-        help='VQA verifier model name.'
+        help="VQA verifier model name.",
     )
 
     # === Local VQA model paths ===
@@ -102,7 +116,6 @@ def parse_arguments():
     parser.add_argument("--qwen2_5_vl_32b_path", type=str, default=None)
     parser.add_argument("--qwen2_5_vl_72b_path", type=str, default=None)
     parser.add_argument("--qwen3_vl_8b_path", type=str, default=None)
-
     parser.add_argument("--distributed_vqa", action="store_true", help="Shard Qwen VQA candidate scoring across ranks.")
     parser.add_argument("--vqa_cleanup_every", type=int, default=16, help="Clear CUDA cache every N local samples during VQA.")
     parser.add_argument("--vqa_attn_implementation", type=str, default="sdpa")
@@ -117,11 +130,25 @@ def parse_arguments():
         type=str,
         default="instruction_plus_target",
         choices=["instruction_only", "target_only", "instruction_plus_target"],
-        help="Stage-1 image query generation mode."
+        help=(
+            "Stage-1 image query generation mode. "
+            "instruction_only and instruction_plus_target use image editing; "
+            "target_only uses pure text-to-image generation through BagelImageEditor.text_to_image_no_think."
+        ),
     )
     parser.add_argument("--bagel_use_multi_gpu", action="store_true", help="Use multi-GPU model-parallel loading for BAGEL in a single process.")
 
+    # === Pure T2I options for image_generation_mode=target_only ===
+    parser.add_argument("--t2i_image_size", type=int, default=1024, help="Generated image size for pure target_only T2I.")
+    parser.add_argument("--t2i_cfg_text_scale", type=float, default=4.0, help="BAGEL text CFG scale for pure T2I.")
+    parser.add_argument("--t2i_cfg_img_scale", type=float, default=1.0, help="BAGEL image CFG scale placeholder for pure T2I.")
+    parser.add_argument("--t2i_cfg_interval", nargs=2, type=float, default=[0.0, 1.0], help="CFG interval for pure T2I.")
+    parser.add_argument("--t2i_num_timesteps", type=int, default=50, help="Denoising steps for pure T2I.")
+    parser.add_argument("--t2i_timestep_shift", type=float, default=3.0, help="Timestep shift for pure T2I.")
+    parser.add_argument("--t2i_cfg_renorm_min", type=float, default=0.0, help="CFG renorm min for pure T2I.")
+    parser.add_argument("--t2i_cfg_renorm_type", type=str, default="text_channel", help="CFG renorm type for pure T2I.")
+
     # === Text-to-Image Retrieval Arguments ===
-    parser.add_argument("--retrieval", type=str, default='default', choices=['default'], help='Type of T2I Retrieval method.')
+    parser.add_argument("--retrieval", type=str, default="default", choices=["default"], help="Type of T2I Retrieval method.")
 
     return parser.parse_args()
