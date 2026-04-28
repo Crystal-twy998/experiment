@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 
 from PIL import Image
 import torch
@@ -8,7 +8,12 @@ from accelerate import infer_auto_device_map, load_checkpoint_and_dispatch, init
 from data.transforms import ImageTransform
 from data.data_utils import add_special_tokens
 from modeling.bagel import (
-    BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
+    BagelConfig,
+    Bagel,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    SiglipVisionConfig,
+    SiglipVisionModel,
 )
 from modeling.qwen2 import Qwen2Tokenizer
 from modeling.autoencoder import load_ae
@@ -16,6 +21,17 @@ from inferencer import InterleaveInferencer
 
 
 class BagelImageEditor:
+    """
+    BAGEL wrapper used by the ZS-CIR pipeline.
+
+    Important behavior:
+    - edit_image_no_think(...): image-conditioned editing / I2I proxy generation.
+    - text_to_image_no_think(...): pure text-to-image generation. This should be used
+      for image_generation_mode == "target_only" when you want to test a real
+      target-caption-only generated image branch.
+    - generate_caption(...): text-only understanding/caption generation.
+    """
+
     def __init__(
         self,
         model_path: str,
@@ -48,10 +64,11 @@ class BagelImageEditor:
 
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if use_multi_gpu is None:
-            # In torchrun / multi-process mode, each process should keep the full model on its own GPU.
+            # In torchrun / multi-process mode, each process should keep the full
+            # model on its own GPU. Multi-GPU dispatch is only useful for a single
+            # process that wants model parallelism.
             use_multi_gpu = torch.cuda.device_count() > 1 and world_size == 1
         self.use_multi_gpu = bool(use_multi_gpu)
-
         self._initialize_model()
 
     def _build_device_map(self, model) -> Dict[str, Union[str, int]]:
@@ -65,22 +82,19 @@ class BagelImageEditor:
             max_memory={i: self.max_mem_per_gpu for i in range(torch.cuda.device_count())},
             no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
         )
-
         same_device_modules = [
-            'language_model.model.embed_tokens',
-            'time_embedder',
-            'latent_pos_embed',
-            'vae2llm',
-            'llm2vae',
-            'connector',
-            'vit_pos_embed'
+            "language_model.model.embed_tokens",
+            "time_embedder",
+            "latent_pos_embed",
+            "vae2llm",
+            "llm2vae",
+            "connector",
+            "vit_pos_embed",
         ]
-
         first_device = device_map.get(same_device_modules[0], 0)
         for module_name in same_device_modules:
             if module_name in device_map:
                 device_map[module_name] = first_device
-
         print(f"[BAGEL] Using inferred multi-GPU device_map: {device_map}")
         return device_map
 
@@ -107,7 +121,7 @@ class BagelImageEditor:
             vit_config=vit_config,
             vae_config=vae_config,
             vit_max_num_patch_per_side=70,
-            connector_act='gelu_pytorch_tanh',
+            connector_act="gelu_pytorch_tanh",
             latent_patch_size=2,
             max_latent_size=64,
         )
@@ -135,7 +149,6 @@ class BagelImageEditor:
             force_hooks=True,
             offload_folder=self.offload_folder,
         )
-
         self.model = self.model.eval()
         print(f"[BAGEL] Model loaded on target_device={self.target_device}, use_multi_gpu={self.use_multi_gpu}")
 
@@ -154,37 +167,70 @@ class BagelImageEditor:
         prompt: str,
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 2.0,
-        cfg_interval: list = [0.0, 1.0],
+        cfg_interval: List[float] = [0.0, 1.0],
         timestep_shift: float = 3.0,
         num_timesteps: int = 50,
         cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "text_channel"
+        cfg_renorm_type: str = "text_channel",
     ) -> Dict[str, Any]:
-        image = Image.open(image_path)
+        """Image-conditioned editing branch. Use for instruction_only and instruction_plus_target."""
+        image = Image.open(image_path).convert("RGB")
         inference_hyper = {
-            'cfg_text_scale': cfg_text_scale,
-            'cfg_img_scale': cfg_img_scale,
-            'cfg_interval': cfg_interval,
-            'timestep_shift': timestep_shift,
-            'num_timesteps': num_timesteps,
-            'cfg_renorm_min': cfg_renorm_min,
-            'cfg_renorm_type': cfg_renorm_type
+            "cfg_text_scale": cfg_text_scale,
+            "cfg_img_scale": cfg_img_scale,
+            "cfg_interval": cfg_interval,
+            "timestep_shift": timestep_shift,
+            "num_timesteps": num_timesteps,
+            "cfg_renorm_min": cfg_renorm_min,
+            "cfg_renorm_type": cfg_renorm_type,
         }
-
         output_dict = self.inferencer(image=image, text=prompt, **inference_hyper)
-        return {'image': output_dict['image']}
+        if output_dict.get("image", None) is None:
+            raise RuntimeError("BAGEL edit_image_no_think returned no image.")
+        return {"image": output_dict["image"]}
+
+    def text_to_image_no_think(
+        self,
+        prompt: str,
+        image_size: int = 1024,
+        cfg_text_scale: float = 4.0,
+        cfg_img_scale: float = 1.0,
+        cfg_interval: List[float] = [0.0, 1.0],
+        timestep_shift: float = 3.0,
+        num_timesteps: int = 50,
+        cfg_renorm_min: float = 0.0,
+        cfg_renorm_type: str = "text_channel",
+    ) -> Dict[str, Any]:
+        """
+        Pure text-to-image branch.
+
+        This intentionally passes image=None to InterleaveInferencer so the generated
+        image is conditioned only on the text prompt. Use this for target_only.
+        """
+        inference_hyper = {
+            "cfg_text_scale": cfg_text_scale,
+            "cfg_img_scale": cfg_img_scale,
+            "cfg_interval": cfg_interval,
+            "timestep_shift": timestep_shift,
+            "num_timesteps": num_timesteps,
+            "cfg_renorm_min": cfg_renorm_min,
+            "cfg_renorm_type": cfg_renorm_type,
+            "image_shapes": (int(image_size), int(image_size)),
+        }
+        output_dict = self.inferencer(image=None, text=prompt, **inference_hyper)
+        if output_dict.get("image", None) is None:
+            raise RuntimeError("BAGEL text_to_image_no_think returned no image.")
+        return {"image": output_dict["image"]}
 
     def generate_caption(
         self,
         prompt: str,
         max_think_token_n: int = 1000,
         do_sample: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> str:
         inference_hyper = {
-            'max_think_token_n': max_think_token_n,
-            'do_sample': do_sample
+            "max_think_token_n": max_think_token_n,
+            "do_sample": do_sample,
         }
         output_dict = self.inferencer(text=prompt, understanding_output=True, **inference_hyper)
-        return output_dict['text']
-
-   
+        return output_dict["text"]
