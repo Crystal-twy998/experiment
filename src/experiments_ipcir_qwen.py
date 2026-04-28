@@ -5,7 +5,7 @@ import json
 import os
 import pickle
 from argparse import Namespace
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Sequence
 
 import termcolor
 import torch
@@ -96,7 +96,12 @@ class Experiment:
         print(f"[Artifact] saved metrics to: {save_path}")
         return save_path
 
-    def _save_rank_artifact(self, tag: str, rankings: Sequence[Sequence[str]], input_kwargs: Dict[str, Any] | None = None) -> str:
+    def _save_rank_artifact(
+        self,
+        tag: str,
+        rankings: Sequence[Sequence[str]],
+        input_kwargs: Dict[str, Any] | None = None,
+    ) -> str:
         input_kwargs = input_kwargs or {}
         save_path = os.path.join(
             self._task_dir(),
@@ -115,7 +120,9 @@ class Experiment:
 
     def run(self):
         clip_model, clip_processor = self.load_Clip_model()
-        target_datasets, query_datasets, pairings, compute_results_function, compute_results_fuse2paths_function = self.load_dataset(clip_processor)
+        target_datasets, query_datasets, pairings, compute_results_function, compute_results_fuse2paths_function = self.load_dataset(
+            clip_processor
+        )
         self.evaluate(
             query_datasets,
             target_datasets,
@@ -227,10 +234,14 @@ class Experiment:
                 "edit_images",
             ]
         }
-
         file_utils.init_folder(self.dataset_path, self.task)
-        image_generation_mode = getattr(self, "image_generation_mode", "instruction_only")
-        image_mode_tag = utils._sanitize_tag(image_generation_mode)
+
+        image_generation_mode = getattr(self, "image_generation_mode", "instruction_plus_target")
+        if hasattr(utils_ipcir_qwen, "stage1_image_mode_tag"):
+            image_mode_tag = utils_ipcir_qwen.stage1_image_mode_tag(image_generation_mode)
+        else:
+            image_mode_tag = utils._sanitize_tag(image_generation_mode)
+
         stage1_edit_img_dir = os.path.join(self.edit_img_dir, image_mode_tag)
         os.makedirs(stage1_edit_img_dir, exist_ok=True)
         os.makedirs(f"{self.dataset_path}/preload/edited_images", exist_ok=True)
@@ -261,6 +272,11 @@ class Experiment:
             preload_dict["new_captions"] = f"{self.dataset_path}/task/{self.task}/new_captions/{self.preload_new_captions}"
 
         print(f"[Stage] stage_mode = {getattr(self, 'stage_mode', 'initial_only')}")
+        print(f"[Stage-1 Image] image_generation_mode = {image_generation_mode}")
+        print(f"[Stage-1 Image] image_mode_tag = {image_mode_tag}")
+        print(f"[Stage-1 Image] edit_img_dir = {stage1_edit_img_dir}")
+        print(f"[Stage-1 Image] edit image metadata = {preload_dict.get('edit_images')}")
+
         bagel_editor = self.load_Bagel_model() if self._should_load_bagel(preload_dict) else None
         if bagel_editor is None:
             print("[BAGEL] Skipped loading BAGEL because modified captions and edited images are already available.")
@@ -344,17 +360,16 @@ class Experiment:
 
             self._release_bagel_editor(bagel_editor)
             bagel_editor = None
-
             if self.distributed and dist.is_initialized():
                 dist.barrier()
-                if not self.is_main_process():
-                    print(f"[Distributed] rank={self.rank} finished VQA shard for {pairing}.")
-                    continue
+
+            if not self.is_main_process():
+                print(f"[Distributed] rank={self.rank} finished VQA shard for {pairing}.")
+                continue
 
             result_metrics, labels = compute_results_fuse2paths_function(**input_kwargs)
             print("\n")
             is_test_split = str(self.split).lower().startswith("test")
-
             if result_metrics is not None:
                 termcolor.cprint(f"Final rerank metrics for {self.dataset.upper()} ({self.split}) - {pairing}", attrs=["bold"])
                 for k, v in result_metrics.items():
