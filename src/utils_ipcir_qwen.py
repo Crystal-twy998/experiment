@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import datetime
+import functools
 import json
 import os
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -51,6 +53,20 @@ def _write_json(path: str, data: Any) -> None:
 
 def _task_dir(dataset_path: str, task: str) -> str:
     return os.path.join(dataset_path, "task", task)
+
+
+def stage1_image_mode_tag(image_generation_mode: str) -> str:
+    """Return the cache/folder tag used by stage-1 generated images.
+
+    The old code used "target_only" for a mode that was still image-conditioned.
+    The corrected target_only branch is pure text-to-image, so it gets a separate
+    tag to avoid silently reusing old reference-conditioned caches.
+    """
+    if str(image_generation_mode) == "target_only":
+        return "target_only_t2i"
+    if hasattr(base_utils, "_sanitize_tag"):
+        return base_utils._sanitize_tag(str(image_generation_mode))
+    return str(image_generation_mode).replace("/", "-").replace(" ", "_")
 
 
 def _read_lookup_csv(csv_path: str, value_key: str) -> Dict[str, str]:
@@ -119,6 +135,7 @@ def _extract_vqa_score(item: Any) -> float:
 
     if _is_number_like(item):
         return float(item)
+
     raise TypeError(f"Cannot extract numeric VQA score from object: {item!r}")
 
 
@@ -139,9 +156,11 @@ def _build_verifier_score_maps(
                         continue
             all_maps.append(score_map)
             continue
+
         if raw is None:
             all_maps.append({})
             continue
+
         values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
         usable = min(len(names_list), len(values))
         score_map: Dict[str, float] = {}
@@ -151,6 +170,7 @@ def _build_verifier_score_maps(
             except Exception:
                 continue
         all_maps.append(score_map)
+
     while len(all_maps) < len(candidate_names):
         all_maps.append({})
     return all_maps
@@ -194,6 +214,7 @@ def _gather_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     trigger NCCL ALLGATHER watchdog timeout. Rank0 writes its local artifacts.
     """
     return _dedup_records(records)
+
 
 def _save_metric_artifact(dataset_path: str, task: str, clip: str, dataset: str, tag: str, metrics: Dict[str, float]) -> str:
     save_path = os.path.join(_task_dir(dataset_path, task), f"result_{clip}_{dataset}_{tag}_{_get_time()}.json")
@@ -324,7 +345,6 @@ def _save_raw_branch_top_rank_artifacts(kwargs: Dict[str, Any], stage1_out: Dict
             records=records,
         )
         saved[f"{branch}_rank_artifact_path"] = path
-
     return saved
 
 
@@ -343,30 +363,102 @@ def _query_id_to_key(qid: Any) -> str:
         return _to_str(qid)
 
 
+def _target_only_t2i_dispatcher(bagel_editor: Any, args: Any):
+    """Return a function with edit_image_no_think's signature but pure T2I behavior."""
+
+    @functools.wraps(bagel_editor.edit_image_no_think)
+    def _dispatch(_image_path: str, prompt: str, *unused_args: Any, **unused_kwargs: Any) -> Dict[str, Any]:
+        if not hasattr(bagel_editor, "text_to_image_no_think"):
+            raise AttributeError(
+                "BAGEL editor has no text_to_image_no_think(...). "
+                "Please replace src/bagel_inference.py with the T2I-enabled version."
+            )
+        return bagel_editor.text_to_image_no_think(
+            prompt=prompt,
+            image_size=int(getattr(args, "t2i_image_size", 1024)),
+            cfg_text_scale=float(getattr(args, "t2i_cfg_text_scale", 4.0)),
+            cfg_img_scale=float(getattr(args, "t2i_cfg_img_scale", 1.0)),
+            cfg_interval=list(getattr(args, "t2i_cfg_interval", [0.0, 1.0])),
+            timestep_shift=float(getattr(args, "t2i_timestep_shift", 3.0)),
+            num_timesteps=int(getattr(args, "t2i_num_timesteps", 50)),
+            cfg_renorm_min=float(getattr(args, "t2i_cfg_renorm_min", 0.0)),
+            cfg_renorm_type=str(getattr(args, "t2i_cfg_renorm_type", "text_channel")),
+        )
+
+    return _dispatch
+
+
+@contextmanager
+def _patched_target_only_t2i_if_needed(args: Any, bagel_editor: Any):
+    """Patch only the base stage-1 call when target_only should be pure T2I.
+
+    utils_ipcir_qwen delegates the fast caption/image generation stage to
+    base_utils.generate_editimg_caption_iteration(...). The original base utils
+    always calls bagel_editor.edit_image_no_think(ref_img_path, prompt). For
+    target_only, we temporarily reroute that call to text_to_image_no_think and
+    also patch base_utils._sanitize_tag so metadata uses target_only_t2i.
+    """
+    image_generation_mode = getattr(args, "image_generation_mode", "instruction_plus_target")
+    if image_generation_mode != "target_only":
+        yield
+        return
+
+    old_edit_method = None
+    if bagel_editor is not None and hasattr(bagel_editor, "edit_image_no_think"):
+        old_edit_method = bagel_editor.edit_image_no_think
+        bagel_editor.edit_image_no_think = _target_only_t2i_dispatcher(bagel_editor, args)
+
+    old_sanitize = getattr(base_utils, "_sanitize_tag", None)
+
+    def _sanitize_tag_t2i(value: Any) -> str:
+        if str(value) == "target_only":
+            return "target_only_t2i"
+        if old_sanitize is not None:
+            return old_sanitize(value)
+        return str(value).replace("/", "-").replace(" ", "_")
+
+    if old_sanitize is not None:
+        base_utils._sanitize_tag = _sanitize_tag_t2i
+
+    try:
+        print("[Stage-1 Image] image_generation_mode=target_only -> pure BAGEL text_to_image_no_think; reference image is ignored.")
+        yield
+    finally:
+        if old_edit_method is not None:
+            bagel_editor.edit_image_no_think = old_edit_method
+        if old_sanitize is not None:
+            base_utils._sanitize_tag = old_sanitize
+
+
+def _run_base_stage1_with_correct_target_only_dispatch(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    args = kwargs["args"]
+    bagel_editor = kwargs.get("bagel_editor", None)
+    with _patched_target_only_t2i_if_needed(args=args, bagel_editor=bagel_editor):
+        return base_utils.generate_editimg_caption_iteration(**kwargs)
+
+
 def generate_editimg_caption_iteration(**kwargs):
     """IP-CIR wrapper.
 
     Fixed behavior:
     1. Run fast t2i/i2i stage through the original utility.
-    2. Build the IP-CIR merged pool for every split/dataset.
-    3. Save merged submissions for CIRR/CIRCO test.
-    4. Save merged top-rank records for train/val/test, always with top-50 names.
-    5. Use merged top-100 candidates for Qwen verifier by default.
+    2. For image_generation_mode == target_only, force true text-to-image generation.
+    3. Build the IP-CIR merged pool for every split/dataset.
+    4. Save merged submissions for CIRR/CIRCO test.
+    5. Save merged top-rank records for train/val/test, always with top-50 names.
+    6. Use merged top-100 candidates for Qwen verifier by default.
     """
     args = kwargs["args"]
     requested_stage_mode = getattr(args, "stage_mode", "initial_only")
 
     # Force original pipeline to stop after fast t2i/i2i, then restore the requested mode.
     setattr(args, "stage_mode", "initial_only")
-    stage1_out = base_utils.generate_editimg_caption_iteration(**kwargs)
+    stage1_out = _run_base_stage1_with_correct_target_only_dispatch(kwargs)
     setattr(args, "stage_mode", requested_stage_mode)
 
-    # Save inspectable top-50 records for raw t2i/i2i.
-    # Do NOT rewrite official raw t2i/i2i submission files here: base_utils already
-    # saves them, and rewriting them can introduce inconsistent subset formatting.
-    # Do not re-save raw t2i/i2i submissions here. The original base_utils
-    # already writes them in the official format. Re-saving in this wrapper
-    # can duplicate/overwrite files and make t2i/i2i subset outputs identical.
+    # Save inspectable top-50 records for raw t2i/i2i. Do NOT rewrite official raw
+    # t2i/i2i submission files here: base_utils already saves them, and rewriting
+    # them can introduce inconsistent subset formatting.
     raw_rank_paths = _save_raw_branch_top_rank_artifacts(kwargs, stage1_out)
     stage1_out.update(raw_rank_paths)
 
@@ -413,8 +505,6 @@ def generate_editimg_caption_iteration(**kwargs):
     if stage1_labels is None:
         stage1_labels = stage1_out["stage1_pool_names"]
 
-    # Merged official test submissions are saved inside compute_results_ipcir_qwen.*_stage1_pool
-    # using the same filename/location/style as raw t2i/i2i and final-rerank submissions.
     stage1_out["stage1_output_metrics"] = stage1_metrics
     stage1_out["stage1_output_labels"] = stage1_labels
     stage1_out["stage1_metric_artifact_path"] = None
@@ -423,7 +513,6 @@ def generate_editimg_caption_iteration(**kwargs):
     # Save top-rank debug records for every split, including test. Always save top-50.
     local_records = _build_stage_records(stage1_out, stage1_labels, topk=50)
     gathered_records = _gather_records(local_records)
-
     if _is_main_process():
         if stage1_metrics is not None:
             stage1_out["stage1_metric_artifact_path"] = _save_metric_artifact(
@@ -445,7 +534,6 @@ def generate_editimg_caption_iteration(**kwargs):
 
     if requested_stage_mode == "initial_only":
         return stage1_out
-
     if requested_stage_mode != "qwen_fusion":
         raise ValueError(f"Unsupported stage_mode in IP-CIR wrapper: {requested_stage_mode}")
 
@@ -475,7 +563,6 @@ def generate_editimg_caption_iteration(**kwargs):
 
     txt_top_captions, txt_top_img_paths = _build_candidate_side_info(rerank_candidates1_names, caption_lookup, path_lookup)
     img_top_captions, img_top_img_paths = _build_candidate_side_info(rerank_candidates2_names, caption_lookup, path_lookup)
-
     txt_check_index = [True for _ in range(len(stage1_out["reference_names"]))]
     img_check_index = [True for _ in range(len(stage1_out["reference_names"]))]
     ref_img_paths = _build_ref_img_paths(stage1_out["reference_names"], path_lookup)
@@ -521,7 +608,6 @@ def generate_editimg_caption_iteration(**kwargs):
 
     verifier_score_maps1 = _build_verifier_score_maps(rerank_candidates1_names, candidates1)
     verifier_score_maps2 = _build_verifier_score_maps(rerank_candidates2_names, candidates2)
-
     stage1_out.update(
         {
             # Use gallery image names as candidate ids so stage-2 reranking matches stage-1 pool.
