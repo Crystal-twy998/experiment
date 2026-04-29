@@ -138,6 +138,40 @@ def parse_arguments():
     )
     parser.add_argument("--bagel_use_multi_gpu", action="store_true", help="Use multi-GPU model-parallel loading for BAGEL in a single process.")
 
+    # === Multi generated-image branch fusion options ===
+    parser.add_argument(
+        "--image_generation_modes",
+        nargs="+",
+        type=str,
+        default=None,
+        choices=["instruction_only", "target_only", "instruction_plus_target"],
+        help=(
+            "Optional list of stage-1 image branches to run/read and fuse before IP-CIR. "
+            "Example: --image_generation_modes instruction_only instruction_plus_target target_only"
+        ),
+    )
+    parser.add_argument(
+        "--image_fusion_mode",
+        type=str,
+        default="none",
+        choices=["none", "avg", "weighted", "weighted_avg"],
+        help=(
+            "Feature-level fusion mode for multiple generated-image branches. "
+            "none keeps the original single-branch behavior; avg/weighted replaces "
+            "predicted_img_features with the fused proxy-image embedding before IP-CIR."
+        ),
+    )
+    parser.add_argument(
+        "--image_fusion_weights",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional branch weights for weighted fusion, e.g. "
+            "instruction_only=0.7 instruction_plus_target=1.0 target_only=0.5. "
+            "In JSON config, a dict is also supported."
+        ),
+    )
+
     # === Pure T2I options for image_generation_mode=target_only ===
     parser.add_argument("--t2i_image_size", type=int, default=1024, help="Generated image size for pure target_only T2I.")
     parser.add_argument("--t2i_cfg_text_scale", type=float, default=4.0, help="BAGEL text CFG scale for pure T2I.")
