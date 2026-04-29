@@ -1,0 +1,124 @@
+[
+  {
+    "exp-name": "CIRR val IP-CIR merged + Qwen rerank pool50",
+    "stage_mode": "qwen_fusion",
+    
+    "image_generation_mode": "instruction_only",
+    "image_generation_modes": [
+      "instruction_only",
+      "instruction_plus_target",
+      "target_only"
+    ],
+    "image_fusion_mode": "avg",
+
+    "topk_for_vqa": 100,
+    "rerank_pool_size": 100,
+    "rank_topk": 100,
+    "stage1_save_topk": 100,
+
+    "ipcir_lambda": 0.0,
+    "ipcir_prior_topk": 100,
+
+    "verifier_candidate_source": "merged_only",
+    "rerank_score_mode": "prior_plus_verifier",
+    "rerank_prior_weight": 0.5,
+    "rerank_verifier1_weight": 0.5,
+    "rerank_verifier2_weight": 0.0,
+    "rerank_dual_verifier_bonus": 0.0,
+    "rerank_dual_verifier_bonus": 0.0,
+    "rerank_dual_retrieval_bonus": 0.0,
+
+    "preload": [
+      "captions",
+      "img_paths",
+      "edited_images",
+      "mods",
+      "img_features"
+    ],
+
+    "clip": "ViT-B-32",
+    "clip_choices": [
+      "ViT-bigG-14",
+      "ViT-B-32",
+      "ViT-B-16",
+      "ViT-L-14",
+      "ViT-H-14",
+      "ViT-g-14"
+    ],
+
+    "dataset": "cirr",
+    "dataset_choices": [
+      "cirr",
+      "circo",
+      "fashioniq_dress",
+      "fashioniq_toptee",
+      "fashioniq_shirt"
+    ],
+
+    "split": "test",
+    "split_choices": [
+      "val",
+      "test"
+    ],
+
+    "dataset_path": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRR",
+    "edit_img_dir": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/CIRR/Edited_Images",
+    "bagel_model_path": "/nativemm/share/cpfs/tangwenyue/models/BAGEL-7B-MoT",
+    "llm_prompt": "prompts.structural_modifier_prompt",
+    "openai_key": "",
+    "max_check_num": 1,
+    "initial_only": false,
+
+    "LLM_model_name": "bagel",
+    "LLM_model_name_choices": [
+      "bagel"
+    ],
+
+    "Check_LLM_model_name": "qwen2_5_vl_7b_instruct",
+    "Check_LLM_model_name_choices": [
+      "qwen2_5_vl_7b_instruct",
+      "qwen2_5_vl_3b_instruct",
+      "qwen2_vl_7b_instruct",
+      "qwen3_vl_8b_instruct",
+      "qwen-turbo",
+      "gpt-4o",
+      "gpt-4o-mini",
+      "gpt-3.5-turbo"
+    ],
+
+    "VQA_LLM_model_name": "qwen2_5_vl_7b_instruct",
+    "VQA_LLM_model_name_choices": [
+      "qwen2_5_vl_7b_instruct",
+      "qwen2_5_vl_3b_instruct",
+      "qwen2_vl_7b_instruct",
+      "qwen3_vl_8b_instruct",
+      "qwen-turbo",
+      "gpt-4o",
+      "gpt-4o-mini",
+      "gpt-3.5-turbo"
+    ],
+
+    "retrieval": "default",
+
+    "preload_modified_captions_file": "cirr_modified_captions_test.json",
+    "preload_image_captions_file": "CIRR_blip2_t5_xxl_captions_test.csv",
+    "preload_image_paths_file": "CIRR_image_paths_test.csv",
+    "preload_edited_images_file": "CIRR_edited_images_test.pkl",
+    "preload_new_captions": "",
+    "preload_suggestions": "",
+    "preload_candidates": "",
+    "preload_pseudo_targets": "",
+
+    "task": "cirr_test_image_fusion_eval_avg_ViT-B-32",
+    "device": 0,
+
+    "distributed_generate": true,
+    "distributed_vqa": true,
+
+    "vqa_min_pixels": 3136,
+    "vqa_max_pixels": 1605632,
+    "vqa_image_max_size": 1024,
+    "vqa_attn_implementation": "sdpa",
+    "vqa_cleanup_every": 16
+  }
+]
