@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import datetime
 import functools
@@ -437,29 +438,483 @@ def _run_base_stage1_with_correct_target_only_dispatch(kwargs: Dict[str, Any]) -
         return base_utils.generate_editimg_caption_iteration(**kwargs)
 
 
+
+def _coerce_mode_list(value: Any) -> List[str]:
+    """Parse image_generation_modes from JSON config or CLI."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.replace(",", " ").split()
+    elif isinstance(value, (list, tuple, set)):
+        raw = []
+        for item in value:
+            if isinstance(item, str):
+                raw.extend(item.replace(",", " ").split())
+            else:
+                raw.append(str(item))
+    else:
+        raw = [str(value)]
+    valid = {"instruction_only", "instruction_plus_target", "target_only"}
+    out: List[str] = []
+    seen = set()
+    for mode in raw:
+        mode = str(mode).strip()
+        if not mode:
+            continue
+        if mode not in valid:
+            raise ValueError(f"Unsupported image generation mode in fusion: {mode!r}. Valid modes: {sorted(valid)}")
+        if mode not in seen:
+            seen.add(mode)
+            out.append(mode)
+    return out
+
+
+def _image_fusion_enabled(args: Any) -> bool:
+    mode = str(getattr(args, "image_fusion_mode", "none") or "none").lower()
+    return mode not in {"", "none", "single", "off", "false", "0"}
+
+
+def _canonical_fusion_mode(args: Any) -> str:
+    mode = str(getattr(args, "image_fusion_mode", "none") or "none").lower()
+    if mode in {"weighted", "weighted_avg", "wavg"}:
+        return "weighted"
+    if mode in {"avg", "mean", "average"}:
+        return "avg"
+    if mode in {"none", "single", "off", "false", "0", ""}:
+        return "none"
+    raise ValueError(f"Unsupported image_fusion_mode={mode!r}; use none, avg, or weighted.")
+
+
+def _parse_fusion_weights(args: Any, modes: Sequence[str]) -> Dict[str, float]:
+    """Parse weights for weighted image-feature fusion."""
+    default = {mode: 1.0 for mode in modes}
+    raw = getattr(args, "image_fusion_weights", None)
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            key = str(key).strip()
+            if key in default:
+                default[key] = float(value)
+        return default
+    if isinstance(raw, str):
+        items = raw.replace(",", " ").split()
+    elif isinstance(raw, (list, tuple, set)):
+        items = []
+        for item in raw:
+            if isinstance(item, str):
+                items.extend(item.replace(",", " ").split())
+            elif isinstance(item, dict):
+                for key, value in item.items():
+                    if str(key) in default:
+                        default[str(key)] = float(value)
+    else:
+        return default
+    for item in items:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in default:
+            default[key] = float(value)
+    return default
+
+
+def _infer_edit_root_from_kwargs(kwargs: Dict[str, Any]) -> str:
+    args = kwargs["args"]
+    edit_root = getattr(args, "edit_img_dir", None)
+    if edit_root:
+        return str(edit_root)
+    current = str(kwargs.get("edit_img_dir", ""))
+    if current:
+        return os.path.dirname(current)
+    return os.path.join(kwargs["dataset_path"], "Edited_Images")
+
+
+def _make_mode_preload_dict(kwargs: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    args = kwargs["args"]
+    mode_tag = stage1_image_mode_tag(mode)
+    preload_dict = dict(kwargs.get("preload_dict", {}))
+    if preload_dict.get("edit_images", None) is not None:
+        edit_meta_file = str(getattr(args, "preload_edited_images_file", "edited_images.pkl"))
+        meta_root, meta_ext = os.path.splitext(edit_meta_file)
+        if meta_ext == "":
+            meta_ext = ".pkl"
+
+        meta_dir = os.path.join(kwargs["dataset_path"], "preload", "edited_images")
+        roots = [meta_root]
+        # Practical fallback: previous single-branch runs may have used
+        # CIRCO_edited_images.pkl, while target-only T2I experiments may have used
+        # CIRCO_edited_images_t2i.pkl. Try both root namespaces before regenerating.
+        if meta_root.endswith("_t2i"):
+            roots.append(meta_root[: -len("_t2i")])
+        else:
+            roots.append(meta_root + "_t2i")
+
+        candidates = []
+        for root in roots:
+            path = os.path.join(meta_dir, f"{root}_{mode_tag}{meta_ext}")
+            if path not in candidates:
+                candidates.append(path)
+
+        chosen = candidates[0]
+        for path in candidates:
+            if os.path.exists(path):
+                chosen = path
+                break
+        preload_dict["edit_images"] = chosen
+    return preload_dict
+
+
+def _make_mode_kwargs(kwargs: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    mode_tag = stage1_image_mode_tag(mode)
+    mode_kwargs = dict(kwargs)
+    mode_args = copy.copy(kwargs["args"])
+    setattr(mode_args, "image_generation_mode", mode)
+    setattr(mode_args, "stage_mode", "initial_only")
+    mode_kwargs["args"] = mode_args
+    mode_kwargs["edit_img_dir"] = os.path.join(_infer_edit_root_from_kwargs(kwargs), mode_tag)
+    mode_kwargs["preload_dict"] = _make_mode_preload_dict(kwargs, mode)
+    mode_kwargs["save_outputs"] = False
+    os.makedirs(mode_kwargs["edit_img_dir"], exist_ok=True)
+    if mode_kwargs["preload_dict"].get("edit_images") is not None:
+        os.makedirs(os.path.dirname(mode_kwargs["preload_dict"]["edit_images"]), exist_ok=True)
+    return mode_kwargs
+
+
+def _normalize_feature_rows(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.normalize(x.float(), dim=-1)
+
+
+def _fuse_proxy_image_features(features_by_mode: Dict[str, torch.Tensor], modes: Sequence[str], fusion_mode: str, weights: Dict[str, float]) -> torch.Tensor:
+    """Fuse multiple proxy-image CLIP embeddings.
+
+    Every branch is L2-normalized before averaging, and the fused vector is
+    L2-normalized again. This keeps cosine retrieval and IP-CIR behavior stable.
+    """
+    if not modes:
+        raise ValueError("No image generation modes were provided for fusion.")
+    ref_shape = None
+    normed = []
+    used_weights = []
+    for mode in modes:
+        if mode not in features_by_mode:
+            raise KeyError(f"Missing predicted_img_features for mode={mode!r}")
+        feat = features_by_mode[mode]
+        if ref_shape is None:
+            ref_shape = tuple(feat.shape)
+        elif tuple(feat.shape) != ref_shape:
+            raise ValueError(f"Feature shape mismatch for {mode}: got {tuple(feat.shape)}, expected {ref_shape}")
+        normed.append(_normalize_feature_rows(feat))
+        used_weights.append(float(weights.get(mode, 1.0)))
+    stack = torch.stack(normed, dim=0)
+    if fusion_mode == "avg":
+        fused = stack.mean(dim=0)
+    elif fusion_mode == "weighted":
+        w = torch.tensor(used_weights, dtype=stack.dtype, device=stack.device).view(-1, 1, 1)
+        fused = (stack * w).sum(dim=0) / torch.clamp(w.sum(), min=1e-8)
+    else:
+        raise ValueError(f"Unsupported fusion mode: {fusion_mode}")
+    return _normalize_feature_rows(fused)
+
+
+
+def _compute_i2i_metrics_for_proxy(
+    kwargs: Dict[str, Any],
+    stage1_out: Dict[str, Any],
+    features: torch.Tensor,
+    tag: str,
+    save_outputs: bool = True,
+) -> Tuple[Any, Any]:
+    """Evaluate a proxy-image feature matrix as one I2I branch.
+
+    This intentionally mirrors eval_image_query_retrieval.py: features are passed
+    directly to the dataset-specific compute_results function with ways=tag.
+    """
+    compute_fn = kwargs.get("compute_results_function", None)
+    if compute_fn is None:
+        return None, None
+    metric_kwargs = dict(kwargs)
+    metric_kwargs.update(stage1_out)
+    metric_kwargs.update(
+        {
+            "predicted_features": features,
+            "loop": 0,
+            "ways": tag,
+            "clip": kwargs.get("clip", getattr(kwargs.get("args"), "clip", None)),
+            "save_outputs": bool(save_outputs and _is_main_process()),
+        }
+    )
+    return compute_fn(**metric_kwargs)
+
+
+def _query_id_to_filename_value(qid: Any) -> str:
+    if isinstance(qid, torch.Tensor):
+        qid = qid.detach().cpu().item()
+    try:
+        if float(qid).is_integer():
+            return str(int(qid))
+    except Exception:
+        pass
+    return _to_str(qid)
+
+
+def _expected_mode_image_paths(kwargs: Dict[str, Any], stage1_out: Dict[str, Any], mode: str) -> List[str]:
+    mode_dir = os.path.join(_infer_edit_root_from_kwargs(kwargs), stage1_image_mode_tag(mode))
+    refs = list(stage1_out.get("reference_names", []))
+    qids = list(stage1_out.get("query_ids", []))
+    paths: List[str] = []
+    for i, ref in enumerate(refs):
+        qid = qids[i] if i < len(qids) else i
+        paths.append(os.path.join(mode_dir, f"{_to_str(ref)}_edited_{_query_id_to_filename_value(qid)}.png"))
+    return paths
+
+
+def _load_mode_image_paths_from_metadata(kwargs: Dict[str, Any], stage1_out: Dict[str, Any], mode: str) -> List[str]:
+    mode_preload = _make_mode_preload_dict(kwargs, mode)
+    meta_path = mode_preload.get("edit_images")
+    expected_len = len(stage1_out.get("reference_names", []))
+
+    candidates: List[str] = []
+    if meta_path:
+        candidates.append(str(meta_path))
+
+    args = kwargs["args"]
+    meta_dir = os.path.join(kwargs["dataset_path"], "preload", "edited_images")
+    root, ext = os.path.splitext(str(getattr(args, "preload_edited_images_file", "edited_images.pkl")))
+    if ext == "":
+        ext = ".pkl"
+    tag = stage1_image_mode_tag(mode)
+    extra_roots = [root, root + "_t2i"]
+    if root.endswith("_t2i"):
+        extra_roots.append(root[: -len("_t2i")])
+    for r in extra_roots:
+        cand = os.path.join(meta_dir, f"{r}_{tag}{ext}")
+        if cand not in candidates:
+            candidates.append(cand)
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            try:
+                import pickle
+                data = pickle.load(open(path, "rb"))
+                img_paths = data.get("all_edit_img_paths", None)
+                if isinstance(img_paths, list) and len(img_paths) == expected_len:
+                    missing = [p for p in img_paths if not isinstance(p, str) or not os.path.exists(p)]
+                    if not missing:
+                        print(f"[Image Fusion] Loaded image paths for mode={mode} from metadata: {path}")
+                        return img_paths
+                    print(f"[Image Fusion] Metadata exists but has {len(missing)} missing images for mode={mode}: {missing[:3]}")
+                else:
+                    print(
+                        f"[Image Fusion] Invalid metadata length for mode={mode}: {path}; "
+                        f"expected {expected_len}, got {0 if img_paths is None else len(img_paths)}"
+                    )
+            except Exception as e:
+                print(f"[Image Fusion] Failed to read metadata for mode={mode}: {path}; error={e}")
+
+    fallback_paths = _expected_mode_image_paths(kwargs, stage1_out, mode)
+    missing = [p for p in fallback_paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"[Image Fusion] Missing generated images for mode={mode}. "
+            f"Tried metadata candidates={candidates}. First missing files={missing[:5]}. "
+            f"Please run the branch once with image_generation_mode={mode}, or check edit_img_dir/preload_edited_images_file."
+        )
+    print(f"[Image Fusion] Using folder fallback image paths for mode={mode}: {os.path.dirname(fallback_paths[0])}")
+    return fallback_paths
+
+
+@torch.no_grad()
+def _encode_generated_image_paths(kwargs: Dict[str, Any], img_paths: Sequence[str], mode: str) -> torch.Tensor:
+    if not img_paths:
+        raise ValueError(f"No image paths provided for mode={mode}")
+    preprocess = kwargs.get("preprocess", None)
+    if preprocess is None:
+        preprocess = kwargs.get("processor", None)
+    if preprocess is None:
+        raise ValueError("Cannot encode generated images: missing preprocess/processor in kwargs.")
+    dataset = base_utils.datasets.EditedImageDataset(list(img_paths), preprocess)
+    feats, _, _, _ = base_utils.extract_image_features(
+        device=kwargs["device"],
+        args=kwargs["args"],
+        dataset=dataset,
+        clip_model=kwargs["clip_model"],
+        batch_size=32,
+        num_workers=4,
+        preload=None,
+    )
+    return _normalize_feature_rows(feats)
+
+
+def _save_top_rank_for_labels(
+    kwargs: Dict[str, Any],
+    stage1_out: Dict[str, Any],
+    tag: str,
+    labels: Any,
+    topk: int = 50,
+) -> Optional[str]:
+    if not _is_main_process() or labels is None:
+        return None
+    records = _build_stage_records(stage1_out, labels, topk=topk)
+    return _save_record_artifact(
+        dataset_path=kwargs["dataset_path"],
+        task=kwargs["task"],
+        clip=kwargs["clip"],
+        dataset=kwargs["dataset_name"],
+        tag=tag,
+        records=_gather_records(records),
+    )
+
+
+def _save_text_top_rank_artifact(kwargs: Dict[str, Any], stage1_out: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    if not _is_main_process():
+        return {"t2i_rank_artifact_path": None}
+    rankings = _safe_get_stage_sequence(stage1_out, "txt_sorted_index_names")
+    if not rankings:
+        return {"t2i_rank_artifact_path": None}
+    records = compute_results_ipcir_qwen.build_top_rank_records(
+        rankings=rankings,
+        query_ids=stage1_out.get("query_ids"),
+        reference_names=stage1_out.get("reference_names"),
+        target_names=stage1_out.get("target_names"),
+        topk=50,
+    )
+    path = _save_record_artifact(
+        dataset_path=kwargs["dataset_path"],
+        task=kwargs["task"],
+        clip=kwargs["clip"],
+        dataset=kwargs["dataset_name"],
+        tag="t2i_loop_0",
+        records=records,
+    )
+    return {"t2i_rank_artifact_path": path}
+
+
+def _run_stage1_with_optional_image_fusion(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    args = kwargs["args"]
+    requested_stage_mode = getattr(args, "stage_mode", "initial_only")
+    fusion_mode = _canonical_fusion_mode(args)
+
+    if fusion_mode == "none":
+        setattr(args, "stage_mode", "initial_only")
+        stage1_out = _run_base_stage1_with_correct_target_only_dispatch(kwargs)
+        setattr(args, "stage_mode", requested_stage_mode)
+        stage1_out["image_fusion_mode"] = "none"
+        return stage1_out
+
+    modes = _coerce_mode_list(getattr(args, "image_generation_modes", None))
+    if len(modes) == 0:
+        modes = [str(getattr(args, "image_generation_mode", "instruction_plus_target"))]
+    if len(modes) < 2:
+        print(f"[Image Fusion] only one mode provided ({modes}); fallback to single-branch behavior.")
+        setattr(args, "stage_mode", "initial_only")
+        stage1_out = _run_base_stage1_with_correct_target_only_dispatch(kwargs)
+        setattr(args, "stage_mode", requested_stage_mode)
+        stage1_out["image_fusion_mode"] = "none"
+        return stage1_out
+
+    base_mode = str(getattr(args, "image_generation_mode", modes[0]))
+    if base_mode not in modes:
+        base_mode = modes[0]
+        setattr(args, "image_generation_mode", base_mode)
+
+    weights = _parse_fusion_weights(args, modes)
+    print(f"[Image Fusion] enabled: mode={fusion_mode}, branches={modes}, base_mode={base_mode}, weights={weights}")
+
+    original_mode = getattr(args, "image_generation_mode", base_mode)
+    setattr(args, "image_generation_mode", base_mode)
+    setattr(args, "stage_mode", "initial_only")
+    stage1_out = _run_base_stage1_with_correct_target_only_dispatch(kwargs)
+    setattr(args, "image_generation_mode", original_mode)
+    setattr(args, "stage_mode", requested_stage_mode)
+
+    features_by_mode: Dict[str, torch.Tensor] = {}
+    paths_by_mode: Dict[str, List[str]] = {}
+    metrics_by_mode: Dict[str, Any] = {}
+    labels_by_mode: Dict[str, Any] = {}
+    rank_artifacts_by_mode: Dict[str, Optional[str]] = {}
+
+    for mode in modes:
+        mode_tag = stage1_image_mode_tag(mode)
+        branch_tag = f"i2i_{mode_tag}"
+        print(f"[Image Fusion] Evaluating raw image branch: mode={mode}, tag={branch_tag}")
+
+        if mode == base_mode:
+            img_paths = list(stage1_out.get("all_edit_img_paths", []))
+            feats = _normalize_feature_rows(stage1_out["predicted_img_features"])
+        else:
+            img_paths = _load_mode_image_paths_from_metadata(kwargs, stage1_out, mode)
+            feats = _encode_generated_image_paths(kwargs, img_paths, mode)
+
+        features_by_mode[mode] = feats
+        paths_by_mode[mode] = img_paths
+        metrics, labels = _compute_i2i_metrics_for_proxy(
+            kwargs=kwargs,
+            stage1_out=stage1_out,
+            features=feats,
+            tag=branch_tag,
+            save_outputs=True,
+        )
+        metrics_by_mode[mode] = metrics
+        labels_by_mode[mode] = labels
+        rank_artifacts_by_mode[mode] = _save_top_rank_for_labels(kwargs, stage1_out, f"{branch_tag}_loop_0", labels, topk=50)
+        if metrics is not None:
+            print(f"[Image Fusion] Raw branch metrics [{branch_tag}]: {metrics}")
+
+    fused_features = _fuse_proxy_image_features(features_by_mode, modes, fusion_mode, weights)
+    fused_tag = f"i2i_fused_{fusion_mode}"
+    print(f"[Image Fusion] Evaluating fused image branch: tag={fused_tag}")
+    fused_metrics, fused_labels = _compute_i2i_metrics_for_proxy(
+        kwargs=kwargs,
+        stage1_out=stage1_out,
+        features=fused_features,
+        tag=fused_tag,
+        save_outputs=True,
+    )
+    fused_rank_artifact = _save_top_rank_for_labels(kwargs, stage1_out, f"{fused_tag}_loop_0", fused_labels, topk=50)
+    if fused_metrics is not None:
+        print(f"[Image Fusion] Fused branch metrics [{fused_tag}]: {fused_metrics}")
+
+    stage1_out["predicted_img_features_by_mode"] = features_by_mode
+    stage1_out["all_edit_img_paths_by_mode"] = paths_by_mode
+    stage1_out["img_output_metrics_by_mode"] = metrics_by_mode
+    stage1_out["img_sorted_index_names_by_mode"] = labels_by_mode
+    stage1_out["i2i_rank_artifact_paths_by_mode"] = rank_artifacts_by_mode
+
+    stage1_out["predicted_img_features_single_branch"] = stage1_out.get("predicted_img_features")
+    stage1_out["img_output_metrics_single_branch"] = stage1_out.get("img_output_metrics")
+    stage1_out["img_sorted_index_names_single_branch"] = stage1_out.get("img_sorted_index_names")
+
+    stage1_out["predicted_img_features"] = fused_features
+    if fused_metrics is not None:
+        stage1_out["img_output_metrics"] = fused_metrics
+    if fused_labels is not None:
+        stage1_out["img_sorted_index_names"] = fused_labels
+
+    stage1_out["image_fusion_mode"] = fusion_mode
+    stage1_out["image_generation_modes"] = list(modes)
+    stage1_out["image_fusion_weights"] = {m: float(weights.get(m, 1.0)) for m in modes}
+    stage1_out["image_fusion_tag"] = fused_tag
+    stage1_out["image_fused_i2i_rank_artifact_path"] = fused_rank_artifact
+    return stage1_out
+
 def generate_editimg_caption_iteration(**kwargs):
     """IP-CIR wrapper.
 
-    Fixed behavior:
-    1. Run fast t2i/i2i stage through the original utility.
-    2. For image_generation_mode == target_only, force true text-to-image generation.
-    3. Build the IP-CIR merged pool for every split/dataset.
-    4. Save merged submissions for CIRR/CIRCO test.
-    5. Save merged top-rank records for train/val/test, always with top-50 names.
-    6. Use merged top-100 candidates for Qwen verifier by default.
+    The only new behavior is optional feature-level fusion of multiple generated-image
+    branches before IP-CIR. Downstream IP-CIR pooling and Qwen reranking are unchanged.
     """
     args = kwargs["args"]
     requested_stage_mode = getattr(args, "stage_mode", "initial_only")
 
-    # Force original pipeline to stop after fast t2i/i2i, then restore the requested mode.
-    setattr(args, "stage_mode", "initial_only")
-    stage1_out = _run_base_stage1_with_correct_target_only_dispatch(kwargs)
+    stage1_out = _run_stage1_with_optional_image_fusion(kwargs)
     setattr(args, "stage_mode", requested_stage_mode)
 
-    # Save inspectable top-50 records for raw t2i/i2i. Do NOT rewrite official raw
-    # t2i/i2i submission files here: base_utils already saves them, and rewriting
-    # them can introduce inconsistent subset formatting.
-    raw_rank_paths = _save_raw_branch_top_rank_artifacts(kwargs, stage1_out)
+    if _canonical_fusion_mode(args) == "none":
+        raw_rank_paths = _save_raw_branch_top_rank_artifacts(kwargs, stage1_out)
+    else:
+        raw_rank_paths = _save_text_top_rank_artifact(kwargs, stage1_out)
     stage1_out.update(raw_rank_paths)
 
     query_caption_features = base_utils.text_encoding(
@@ -471,7 +926,6 @@ def generate_editimg_caption_iteration(**kwargs):
     )
     query_caption_features = torch.nn.functional.normalize(query_caption_features.float(), dim=-1)
 
-    # User-requested default: rerank merged top-100 candidates.
     rerank_pool_size = int(getattr(args, "rerank_pool_size", getattr(args, "topk_for_vqa", 100)))
     rerank_pool_size = max(rerank_pool_size, 100)
     prior_topk = int(getattr(args, "ipcir_prior_topk", max(rerank_pool_size, 100)))
@@ -500,7 +954,6 @@ def generate_editimg_caption_iteration(**kwargs):
         }
     )
 
-    # Compute merged metrics and labels. For CIRR/CIRCO test, this also writes merged submission files.
     stage1_metrics, stage1_labels = _compute_stage1_metrics_and_labels(kwargs["dataset_name"], stage1_out, kwargs)
     if stage1_labels is None:
         stage1_labels = stage1_out["stage1_pool_names"]
@@ -510,7 +963,6 @@ def generate_editimg_caption_iteration(**kwargs):
     stage1_out["stage1_metric_artifact_path"] = None
     stage1_out["stage1_rank_artifact_path"] = None
 
-    # Save top-rank debug records for every split, including test. Always save top-50.
     local_records = _build_stage_records(stage1_out, stage1_labels, topk=50)
     gathered_records = _gather_records(local_records)
     if _is_main_process():
@@ -557,7 +1009,6 @@ def generate_editimg_caption_iteration(**kwargs):
         rerank_candidates1_names = merged_top_names
         rerank_candidates2_names = [list(x[:rerank_pool_size]) for x in stage1_out["img_sorted_index_names"]]
     else:
-        # Default: only score the IP-CIR merged candidates once.
         rerank_candidates1_names = merged_top_names
         rerank_candidates2_names = [[] for _ in merged_top_names]
 
@@ -610,7 +1061,6 @@ def generate_editimg_caption_iteration(**kwargs):
     verifier_score_maps2 = _build_verifier_score_maps(rerank_candidates2_names, candidates2)
     stage1_out.update(
         {
-            # Use gallery image names as candidate ids so stage-2 reranking matches stage-1 pool.
             "candidates1": rerank_candidates1_names,
             "candidates2": rerank_candidates2_names,
             "ranks1": verifier_score_maps1,
