@@ -3,7 +3,7 @@ source /nativemm/share/cpfs/tangwenyue/Reasoning/venv/bin/activate
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-main
+cd /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-improved
 
 VENV_PYTHON="/nativemm/share/cpfs/tangwenyue/Reasoning/venv/bin/python"
 export PATH="/nativemm/share/cpfs/tangwenyue/Reasoning/venv/bin:$PATH"
@@ -36,39 +36,16 @@ echo "NPROC=$NPROC"
 # "$VENV_PYTHON" -m torch.distributed.run \
 #   --standalone \
 #   --nproc_per_node="$NPROC" \
-#   src/main.py \
-#   --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-main/config/start_config_circo.json \
-#   --distributed_generate \
-#   --distributed_vqa
-
-# "$VENV_PYTHON" -m torch.distributed.run \
-#   --standalone \
-#   --nproc_per_node="$NPROC" \
-#   src/main.py \
-#   --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-main/config/start_config_cirr.json \
-#   --distributed_generate \
-#   --distributed_vqa
-
-# "$VENV_PYTHON" -m torch.distributed.run \
-#   --standalone \
-#   --nproc_per_node="$NPROC" \
-#   src/main.py \
-#   --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-main/config/start_config_circo_test.json \
-#   --distributed_generate \
-#   --distributed_vqa
-
-# "$VENV_PYTHON" -m torch.distributed.run \
-#   --standalone \
-#   --nproc_per_node="$NPROC" \
-#   src/main.py \
-#   --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-main/config/start_config_cirr_test.json \
+#   src/main_ipcir_qwen.py \
+#   --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-improved/config/start_config_circo_ipcir_qwen.json \
 #   --distributed_generate \
 #   --distributed_vqa
 
 "$VENV_PYTHON" -m torch.distributed.run \
   --standalone \
   --nproc_per_node="$NPROC" \
-  src/main.py \
-  --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-main/config/start_config_circo_text.json \
+  src/main_ipcir_qwen.py \
+  --config /nativemm/share/cpfs/tangwenyue/Reasoning/WISER-improved/config/start_config_circo_multi_image_fusion.json \
   --distributed_generate \
   --distributed_vqa
+
