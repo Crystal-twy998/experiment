@@ -1,0 +1,76 @@
+[
+  {
+    "exp-name": "FASHIONIQ toptee val IP-CIR merged + Qwen rerank pool100",
+    "stage_mode": "qwen_fusion",
+
+    "image_generation_mode": "instruction_plus_target",
+    "image_generation_modes": [
+      "instruction_only",
+      "instruction_plus_target",
+      "target_only"
+    ],
+    "image_fusion_mode": "avg",
+
+    "topk_for_vqa": 100,
+    "rerank_pool_size": 100,
+    "rank_topk": 100,
+    "stage1_save_topk": 100,
+
+    "ipcir_lambda": 0.0,
+    "ipcir_prior_topk": 100,
+
+    "verifier_candidate_source": "merged_only",
+    "rerank_score_mode": "prior_plus_verifier",
+    "rerank_prior_weight": 0.5,
+    "rerank_verifier1_weight": 0.5,
+    "rerank_verifier2_weight": 0.0,
+    "rerank_dual_verifier_bonus": 0.0,
+    "rerank_dual_retrieval_bonus": 0.0,
+
+    "preload": [
+      "captions",
+      "img_paths",
+      "edited_images",
+      "mods",
+      "img_features"
+    ],
+
+    "clip": "ViT-g-14",
+    "clip_choices": [
+      "ViT-bigG-14",
+      "ViT-B-32",
+      "ViT-B-16",
+      "ViT-L-14",
+      "ViT-H-14",
+      "ViT-g-14"
+    ],
+
+    "dataset": "fashioniq_toptee",
+    "split": "val",
+
+    "dataset_path": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/FASHIONIQ",
+    "edit_img_dir": "/nativemm/share/cpfs/tangwenyue/Reasoning/Datasets/FASHIONIQ/Edited_Images",
+    "bagel_model_path": "/nativemm/share/cpfs/tangwenyue/models/BAGEL-7B-MoT",
+    "llm_prompt": "prompts.structural_modifier_prompt_fashion",
+    "openai_key": "",
+    "max_check_num": 1,
+    "initial_only": false,
+
+    "LLM_model_name": "bagel",
+    "Check_LLM_model_name": "qwen2_5_vl_7b_instruct",
+    "VQA_LLM_model_name": "qwen2_5_vl_7b_instruct",
+
+    "retrieval": "default",
+
+    "preload_modified_captions_file": "fiq_toptee_modified_captions.json",
+    "preload_image_captions_file": "FASHIONIQ_blip2_t5_xxl_captions.csv",
+    "preload_image_paths_file": "FASHIONIQ_image_paths.csv",
+    "preload_edited_images_file": "FASHIONIQ_toptee_edited_images.pkl",
+    "preload_new_captions": "",
+    "preload_suggestions": "",
+    "preload_candidates": "",
+    "preload_pseudo_targets": "",
+
+    "task": "fiq_val_image_fusion_eval_avg_ViT-g-14"
+  }
+]
