@@ -239,10 +239,10 @@ class FashionIQDataset(Dataset):
                 reference_name = self.triplets[index]['candidate']
 
                 if self.split in ['train', 'val']:
-                    reference_image_path = self.dataset_path / 'images' / f"{reference_name}.png"
+                    reference_image_path = self.dataset_path / 'images' / f"{reference_name}.jpg" # .png
                     # reference_image = self.preprocess(PIL.Image.open(reference_image_path))
                     target_name = self.triplets[index]['target']
-                    target_image_path = self.dataset_path / 'images' / f"{target_name}.png"
+                    target_image_path = self.dataset_path / 'images' / f"{target_name}.jpg" # .png
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
                     # blip_ref_img = self.blip_transform(PIL.Image.open(reference_image_path).convert('RGB'))
                     # blip_target_img = self.blip_transform(PIL.Image.open(target_image_path).convert('RGB'))
@@ -259,7 +259,7 @@ class FashionIQDataset(Dataset):
                     }
 
                 elif self.split == 'test':
-                    reference_image_path = self.dataset_path / 'images' / f"{reference_name}.png"
+                    reference_image_path = self.dataset_path / 'images' / f"{reference_name}.jpg" # .png
                     # reference_image = self.preprocess(PIL.Image.open(reference_image_path))
                     # blip_ref_img = self.blip_transform(PIL.Image.open(reference_image_path).convert('RGB'))
 
@@ -273,7 +273,7 @@ class FashionIQDataset(Dataset):
 
             elif self.mode == 'classic':
                 image_name = self.image_names[index]
-                image_path = self.dataset_path / 'images' / f"{image_name}.png"
+                image_path = self.dataset_path / 'images' / f"{image_name}.jpg" # .png
                 image = self.preprocess(PIL.Image.open(image_path))
                 # blip_img = self.blip_transform(PIL.Image.open(image_path).convert('RGB'))
                 return {
