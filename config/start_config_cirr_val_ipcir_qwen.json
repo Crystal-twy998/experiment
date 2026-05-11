@@ -1,7 +1,8 @@
 [
   {
     "exp-name": "CIRR val IP-CIR merged + Qwen rerank pool50",
-    "stage_mode": "qwen_fusion",
+    "stage_mode": "initial_only",
+    "image_generation_mode": "target_only",
 
     "topk_for_vqa": 100,
     "rerank_pool_size": 100,
@@ -90,7 +91,7 @@
 
     "retrieval": "default",
 
-    "preload_modified_captions_file": "cirr_val_mods_mllm_cot.json",
+    "preload_modified_captions_file": "cirr_modified_captions.json",
     "preload_image_captions_file": "CIRR_blip2_t5_xxl_captions_val.csv",
     "preload_image_paths_file": "CIRR_image_paths_val.csv",
     "preload_edited_images_file": "CIRR_edited_images_val.pkl",
@@ -99,7 +100,7 @@
     "preload_candidates": "",
     "preload_pseudo_targets": "",
 
-    "task": "cirr_val_text_branch",
+    "task": "cirr_val_ipcir_qwen",
     "device": 0,
 
     "distributed_generate": true,
