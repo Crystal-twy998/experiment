@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -63,7 +63,10 @@ def _gather_query_image_features(
         else:
             rows.append(index_features[idx])
     if missing:
-        raise KeyError(f"Failed to locate {len(missing)} reference images in index_names; examples: {missing[:5]}")
+        raise KeyError(
+            f"Failed to locate {len(missing)} reference images in index_names; "
+            f"examples: {missing[:5]}"
+        )
     return torch.stack(rows, dim=0)
 
 
@@ -89,14 +92,12 @@ def _topk_score_map(
     return {_to_str(index_names[i]): float(v) for i, v in zip(inds, vals)}
 
 
-def _all_rankings(scores: torch.Tensor, index_names: Sequence[str]) -> List[List[str]]:
-    inds = torch.argsort(scores, dim=-1, descending=True)
+def _topk_rankings(scores: torch.Tensor, index_names: Sequence[str], topk: int) -> List[List[str]]:
+    k = min(int(topk), int(scores.shape[-1]))
+    _, inds = torch.topk(scores, k=k, dim=-1, largest=True, sorted=True)
     inds_np = inds.detach().cpu().numpy()
-    all_names = []
     index_names_list = [_to_str(x) for x in index_names]
-    for row in inds_np:
-        all_names.append([index_names_list[i] for i in row.tolist()])
-    return all_names
+    return [[index_names_list[i] for i in row.tolist()] for row in inds_np]
 
 
 def _pick_work_device(*tensors: torch.Tensor) -> torch.device:
@@ -124,23 +125,29 @@ def build_ipcir_stage1_pool(
     index_names: Sequence[str],
     lambda_weight: float = 0.3,
     prior_topk: int = 100,
+    text_similarity_override: Optional[torch.Tensor] = None,
 ) -> Stage1PoolResult:
-    """
-    Strict IP-CIR stage-1 retrieval:
+    """Strict IP-CIR stage-1 retrieval.
 
-    1) f_s = f_t - f_o
-    2) f_RP = f_p + max(f_p)/max(f_q) * f_q + max(f_p)/max(f_s) * f_s
-    3) S_p = sim(f_RP, gallery), S_t = sim(f_t, gallery)
-    4) S_b = S_t * S_p
-    5) S_f = lambda * S_t + (1 - lambda) * S_b
+    Default formula:
+        1) f_s = f_t - f_o
+        2) f_RP = f_p + max(f_p)/max(f_q) * f_q + max(f_p)/max(f_s) * f_s
+        3) S_p = sim(f_RP, gallery), S_t = sim(f_t, gallery)
+        4) S_b = S_t * S_p
+        5) S_f = lambda * S_t + (1 - lambda) * S_b
+
+    Multi-text extension:
+        If text_similarity_override is provided, it replaces S_t in steps 4/5.
+        target_caption_features is still used to build f_s, so avg-embedding and
+        S_t-replacement can be evaluated independently.
     """
     work_device = _pick_work_device(
         target_caption_features,
         proxy_image_features,
         query_caption_features,
         index_features,
+        text_similarity_override if text_similarity_override is not None else index_features,
     )
-
     target_caption_features = _move_to_device(target_caption_features, work_device)
     proxy_image_features = _move_to_device(proxy_image_features, work_device)
     query_caption_features = _move_to_device(query_caption_features, work_device)
@@ -150,32 +157,38 @@ def build_ipcir_stage1_pool(
     f_t = _normalize_rows(target_caption_features)
     f_p = _normalize_rows(proxy_image_features)
     f_o = _normalize_rows(query_caption_features)
-
     f_q = _gather_query_image_features(reference_names, index_names, gallery)
     f_q = _move_to_device(f_q, work_device)
     f_q = _normalize_rows(f_q)
 
     f_s = f_t - f_o
 
-    # Follow the paper's RP construction using max-based rescaling.
     max_fp = torch.amax(f_p, dim=-1, keepdim=True)
     max_fq = torch.amax(f_q, dim=-1, keepdim=True).clamp_min(1e-8)
     max_fs = torch.amax(torch.abs(f_s), dim=-1, keepdim=True).clamp_min(1e-8)
-
     f_rp = f_p + (max_fp / max_fq) * f_q + (max_fp / max_fs) * f_s
     f_rp = _normalize_rows(f_rp)
 
-    s_t = torch.matmul(f_t, gallery.T)
+    if text_similarity_override is None:
+        s_t = torch.matmul(f_t, gallery.T)
+    else:
+        s_t = _move_to_device(text_similarity_override.float(), work_device)
+        expected = (f_t.shape[0], gallery.shape[0])
+        if tuple(s_t.shape) != expected:
+            raise ValueError(
+                "text_similarity_override shape mismatch: "
+                f"got {tuple(s_t.shape)}, expected {expected}"
+            )
+
     s_p = torch.matmul(f_rp, gallery.T)
     s_b = s_t * s_p
     s_f = float(lambda_weight) * s_t + (1.0 - float(lambda_weight)) * s_b
 
-    merged_names = _all_rankings(s_f, index_names)
+    topk = int(prior_topk)
+    merged_names = _topk_rankings(s_f, index_names, topk)
     merged_score_maps = []
     text_score_maps = []
     proxy_score_maps = []
-    topk = int(prior_topk)
-
     for i in range(s_f.shape[0]):
         merged_score_maps.append(_topk_score_map(s_f[i], index_names, topk))
         text_score_maps.append(_topk_score_map(s_t[i], index_names, topk))
