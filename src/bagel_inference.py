@@ -1,35 +1,33 @@
 import os
-from typing import Any, Dict, Optional, Union, List
+from typing import Any, Dict, List, Optional, Union
 
-from PIL import Image
 import torch
-from accelerate import infer_auto_device_map, load_checkpoint_and_dispatch, init_empty_weights
+from PIL import Image
+from accelerate import infer_auto_device_map, init_empty_weights, load_checkpoint_and_dispatch
 
-from data.transforms import ImageTransform
 from data.data_utils import add_special_tokens
+from data.transforms import ImageTransform
+from inferencer import InterleaveInferencer
+from modeling.autoencoder import load_ae
 from modeling.bagel import (
-    BagelConfig,
     Bagel,
+    BagelConfig,
     Qwen2Config,
     Qwen2ForCausalLM,
     SiglipVisionConfig,
     SiglipVisionModel,
 )
 from modeling.qwen2 import Qwen2Tokenizer
-from modeling.autoencoder import load_ae
-from inferencer import InterleaveInferencer
 
 
 class BagelImageEditor:
-    """
-    BAGEL wrapper used by the ZS-CIR pipeline.
+    """BAGEL wrapper used by the ZS-CIR / IP-CIR pipeline.
 
-    Important behavior:
-    - edit_image_no_think(...): image-conditioned editing / I2I proxy generation.
-    - text_to_image_no_think(...): pure text-to-image generation. This should be used
-      for image_generation_mode == "target_only" when you want to test a real
-      target-caption-only generated image branch.
-    - generate_caption(...): text-only understanding/caption generation.
+    Public methods:
+      - edit_image_no_think(...): image-conditioned proxy image generation.
+      - text_to_image_no_think(...): pure text-to-image proxy image generation.
+      - generate_caption(...): text-only target text generation.
+      - generate_caption_from_image(...): image-conditioned target text generation.
     """
 
     def __init__(
@@ -64,9 +62,8 @@ class BagelImageEditor:
 
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if use_multi_gpu is None:
-            # In torchrun / multi-process mode, each process should keep the full
-            # model on its own GPU. Multi-GPU dispatch is only useful for a single
-            # process that wants model parallelism.
+            # In torchrun, every process should keep the full model on its own GPU.
+            # Model parallel dispatch is only for single-process runs.
             use_multi_gpu = torch.cuda.device_count() > 1 and world_size == 1
         self.use_multi_gpu = bool(use_multi_gpu)
         self._initialize_model()
@@ -173,7 +170,6 @@ class BagelImageEditor:
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "text_channel",
     ) -> Dict[str, Any]:
-        """Image-conditioned editing branch. Use for instruction_only and instruction_plus_target."""
         image = Image.open(image_path).convert("RGB")
         inference_hyper = {
             "cfg_text_scale": cfg_text_scale,
@@ -201,12 +197,6 @@ class BagelImageEditor:
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "text_channel",
     ) -> Dict[str, Any]:
-        """
-        Pure text-to-image branch.
-
-        This intentionally passes image=None to InterleaveInferencer so the generated
-        image is conditioned only on the text prompt. Use this for target_only.
-        """
         inference_hyper = {
             "cfg_text_scale": cfg_text_scale,
             "cfg_img_scale": cfg_img_scale,
@@ -233,4 +223,35 @@ class BagelImageEditor:
             "do_sample": do_sample,
         }
         output_dict = self.inferencer(text=prompt, understanding_output=True, **inference_hyper)
+        return output_dict["text"]
+
+    def generate_caption_from_image(
+        self,
+        image_path: str,
+        prompt: str,
+        max_think_token_n: int = 1000,
+        do_sample: bool = False,
+    ) -> str:
+        """Image-conditioned target-text generation for multi-text IP-CIR.
+
+        This is intentionally separate from edit_image_no_think: it uses the
+        reference image as visual context and requests a text answer through the
+        BAGEL visual-understanding path.
+        """
+        image = Image.open(image_path).convert("RGB")
+        inference_hyper = {
+            "max_think_token_n": max_think_token_n,
+            "do_sample": do_sample,
+        }
+        output_dict = self.inferencer(
+            image=image,
+            text=prompt,
+            understanding_output=True,
+            **inference_hyper,
+        )
+        if "text" not in output_dict:
+            raise RuntimeError(
+                "BAGEL generate_caption_from_image returned no text. "
+                "Check whether InterleaveInferencer supports image-conditioned understanding_output."
+            )
         return output_dict["text"]
