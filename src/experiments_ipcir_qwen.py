@@ -132,9 +132,15 @@ class Experiment:
             clip_model,
             clip_processor,
         )
+        # Do not call a final distributed barrier here. In qwen_fusion, rank0 can
+        # spend much longer in final reranking while non-main ranks have already
+        # finished their verifier shard; a final barrier is a common NCCL timeout
+        # trigger. There are no remaining collectives after this point.
         if self.distributed and dist.is_initialized():
-            dist.barrier()
-            dist.destroy_process_group()
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                print(f"[Distributed] destroy_process_group failed: {e}")
         if self.is_main_process():
             print("Finish.")
 
@@ -173,15 +179,62 @@ class Experiment:
             print(f"[BAGEL] Failed to validate edited image cache {metadata_path}: {e}")
             return False
 
+    def _multi_text_cache_ready(self) -> bool:
+        raw_enabled = getattr(self, "enable_multi_text_queries", False)
+        if isinstance(raw_enabled, str):
+            enabled = raw_enabled.strip().lower() == "true"
+        else:
+            enabled = bool(raw_enabled)
+        print(f"[BAGEL] raw enable_multi_text_queries: {raw_enabled!r}; bool={enabled!r}")
+        if not enabled:
+            return True
+        explicit = str(getattr(self, "multi_text_queries_path", "") or "").strip()
+        if explicit:
+            path = explicit
+        else:
+            filename = f"{self.dataset}_{self.split}_multi_text_queries.json"
+            path = os.path.join(self.dataset_path, "task", self.task, "modified_captions", filename)
+        ready = os.path.exists(path) and os.path.getsize(path) > 0
+        print(f"[BAGEL] multi-text query cache ready: {ready} ({path})")
+        return ready
+
+    def _multi_text_enabled(self) -> bool:
+        raw_enabled = getattr(self, "enable_multi_text_queries", False)
+        if isinstance(raw_enabled, str):
+            return raw_enabled.strip().lower() == "true"
+        return bool(raw_enabled)
+
     def _should_load_bagel(self, preload_dict) -> bool:
         stage_mode = getattr(self, "stage_mode", "initial_only")
         if stage_mode not in {"initial_only", "qwen_fusion"}:
             return True
+
         mods_ready = preload_dict.get("mods") is not None and os.path.exists(preload_dict["mods"])
         edits_ready = self._edited_images_cache_ready(preload_dict.get("edit_images"))
+        multi_enabled = self._multi_text_enabled()
+        multi_text_ready = self._multi_text_cache_ready()
+
         print(f"[BAGEL] modified captions ready: {mods_ready}")
         print(f"[BAGEL] edited images ready: {edits_ready}")
-        return not (mods_ready and edits_ready)
+        print(f"[BAGEL] distributed={self.distributed} rank={self.rank} world_size={self.world_size}")
+
+        # If base Stage-1 caches are missing, preserve the original behavior:
+        # every active generation rank may need BAGEL to create captions/images.
+        if not (mods_ready and edits_ready):
+            print("[BAGEL] base Stage-1 cache incomplete; load BAGEL on this rank.")
+            return True
+
+        # If old base caches exist and only the new multi-text cache is missing,
+        # do NOT load BAGEL on every torchrun process. Rank0 alone generates the
+        # vision-conditioned text JSON; other ranks wait for that file in
+        # utils_ipcir_qwen._ensure_multi_text_queries().
+        if multi_enabled and not multi_text_ready:
+            need = self.is_main_process()
+            print(f"[BAGEL] multi-text cache missing; load BAGEL only on rank0. this_rank_load={need}")
+            return need
+
+        print("[BAGEL] all required caches are ready; skip BAGEL loading.")
+        return False
 
     def load_dataset(self, clip_processor):
         target_datasets, query_datasets, pairings = [], [], []
@@ -241,7 +294,6 @@ class Experiment:
             image_mode_tag = utils_ipcir_qwen.stage1_image_mode_tag(image_generation_mode)
         else:
             image_mode_tag = utils._sanitize_tag(image_generation_mode)
-
         stage1_edit_img_dir = os.path.join(self.edit_img_dir, image_mode_tag)
         os.makedirs(stage1_edit_img_dir, exist_ok=True)
         os.makedirs(f"{self.dataset_path}/preload/edited_images", exist_ok=True)
@@ -279,7 +331,7 @@ class Experiment:
 
         bagel_editor = self.load_Bagel_model() if self._should_load_bagel(preload_dict) else None
         if bagel_editor is None:
-            print("[BAGEL] Skipped loading BAGEL because modified captions and edited images are already available.")
+            print("[BAGEL] Skipped loading BAGEL because all required stage-1 caches are available.")
 
         for query_dataset, target_dataset, pairing in zip(query_datasets, target_datasets, pairings):
             termcolor.cprint(f"\n------ Evaluating Retrieval Setup: {pairing}", color="yellow", attrs=["bold"])
@@ -307,7 +359,6 @@ class Experiment:
                 "clip": self.clip,
                 "preprocess": clip_processor,
             }
-
             print(f"Extracting target image features using CLIP: {self.clip}.")
             index_features, index_names, index_ranks, aux_data = utils.extract_image_features(
                 self.device,
@@ -353,6 +404,10 @@ class Experiment:
                     print(f"[Stage1 merged] metric file: {input_kwargs['stage1_metric_artifact_path']}")
                 if input_kwargs.get("stage1_rank_artifact_path"):
                     print(f"[Stage1 merged] rank file: {input_kwargs['stage1_rank_artifact_path']}")
+                if input_kwargs.get("multi_text_query_path"):
+                    print(f"[MultiText] query file: {input_kwargs['multi_text_query_path']}")
+                if input_kwargs.get("multi_text_rank_artifact_paths"):
+                    print(f"[MultiText] rank files: {input_kwargs['multi_text_rank_artifact_paths']}")
 
             if getattr(self, "stage_mode", "initial_only") == "initial_only":
                 print("\nInitial-only stage finished.")
@@ -360,10 +415,11 @@ class Experiment:
 
             self._release_bagel_editor(bagel_editor)
             bagel_editor = None
-            if self.distributed and dist.is_initialized():
-                dist.barrier()
 
-            if not self.is_main_process():
+            # No distributed barrier here. The VQA stage may be sharded internally
+            # by base_utils.get_pseudo_targets; after it returns, non-main ranks can
+            # exit without waiting for rank0's final metrics/JSON writing.
+            if self.distributed and not self.is_main_process():
                 print(f"[Distributed] rank={self.rank} finished VQA shard for {pairing}.")
                 continue
 
@@ -377,10 +433,10 @@ class Experiment:
                 if not is_test_split:
                     self._save_metric_artifact("final_rerank", result_metrics)
             else:
-                termcolor.cprint(f"No explicit final metrics available for {self.dataset.upper()} ({self.split}) - {pairing}.", attrs=["bold"])
-
-            # Important fix: save final top-rank records for both val and test.
-            # The saved record always contains top-50 names even if the rerank pool is 100+.
+                termcolor.cprint(
+                    f"No explicit final metrics available for {self.dataset.upper()} ({self.split}) - {pairing}.",
+                    attrs=["bold"],
+                )
             if labels is not None:
                 self._save_rank_artifact("final_rerank", labels, input_kwargs)
 
