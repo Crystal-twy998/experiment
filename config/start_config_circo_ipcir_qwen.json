@@ -2,7 +2,7 @@
   {
     "exp-name": "CIRCO IP-CIR merged + Qwen rerank pool100",
     "stage_mode": "qwen_fusion",
-    "image_generation_mode": "target_only",
+    "image_generation_mode": "instruction_only",
 
     "topk_for_vqa": 100,
     "rerank_pool_size": 100,
