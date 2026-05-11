@@ -15,7 +15,7 @@ import torch.distributed as dist
 import compute_results_ipcir_qwen
 import utils as base_utils
 from stage1_pooling import build_ipcir_stage1_pool
-
+from tqdm import tqdm
 
 def _to_str(x: Any) -> str:
     if isinstance(x, bytes):
